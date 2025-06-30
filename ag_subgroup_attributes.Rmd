@@ -2,7 +2,7 @@
 title: "Agriculture Subgroup Attributes"
 author: "Maddee Rubenson (FlowWest)"
 date: "`r Sys.Date()`"
-output: html_document
+output: github_document
 ---
 
 ```{r setup, include=FALSE}
@@ -54,10 +54,10 @@ yearly_water_allocation |>
 yearly_water_allocation |> 
   ggplot(aes(x = year, y = percent_of_total)) +
   geom_col() + 
-  geom_hline(aes(yintercept = 80, color = "darkred"), linetype = "dashed", linewidth = 2) + 
+  geom_hline(aes(yintercept = 80), linetype = "dashed", linewidth = 2, color = "darkred") + 
   theme_minimal() + 
   ggtitle("The number of years with 80% water allocation in the Klamath Basin", 
-          subtitle = "Where the red dashed line represents the 80% allocation")
+          subtitle = "Where the red dashed line represents the 80% allocation") 
 ```
 
 [^1]: <https://www.siskiyoucounty.gov/naturalresources/page/water-reductions-klamath-basin-devastate-jobs-and-local-economy#>:\~:text=For%20context%2C%20the%20USBR's%20current,zero%20and%20155%2C000%20acre%2Dfeet.

@@ -327,3 +327,9 @@ crops |>
     legend.title = element_blank()
   )
 ```
+
+### Crop Stats
+
+https://www.usbr.gov/projects/pdf.php?id=7
+
+focus on getting the water information

@@ -11,6 +11,8 @@ knitr::opts_chunk$set(echo = TRUE)
 library(sf)
 library(tidyverse)
 library(leaflet)
+library(terra)
+
 ```
 
 ```{r include=FALSE}
@@ -100,4 +102,158 @@ leaflet() |>
   )
   
 
+```
+
+## DEM
+
+Download the DEM using the `elevatr` package
+
+DEM is in meters.
+
+We have access to a high resolution DEM and bathymetric dataset if we want to continue this route. The following is exploratory. 
+
+```{r eval=FALSE, include=FALSE}
+library(elevatr)
+library(terra)
+
+aoi <- klamath_basin
+
+dem <- get_elev_raster(
+  locations = aoi,
+  z = 12,          # higher = finer (~10–30 m typical)
+  clip = "locations"
+)
+
+dem_rast <- rast(dem)
+plot(dem_rast)
+
+saveRDS(dem, here::here("data-raw", "DEM", "dem.rds"))
+saveRDS(dem_rast, here::here("data-raw", "DEM", "dem_rast.rds"))
+
+```
+## Map Floodplain Inundation 
+
+The bathtub approach is a simple DEM-based method used to approximate floodplain inundation by comparing terrain elevation to a specified water surface elevation (WSE). In this framework, the landscape is treated as if water fills the topography like a rising bathtub: all cells in the DEM with elevations lower than the assumed WSE are classified as inundated. To improve realism, the analysis typically restricts inundation to areas hydraulically connected to the river channel, which prevents isolated depressions from being incorrectly labeled as flooded. Because it relies only on elevation and an assumed stage, the bathtub method is computationally efficient and well suited for scenario screening, visualization, and communication of potential flood extents. However, it does not simulate hydraulic processes such as flow momentum, roughness, backwater effects, or levee overtopping, and therefore represents a static approximation rather than a physically dynamic flood model.
+
+```{r}
+# inputs
+#dem_raw <- readRDS(here::here("data-raw", "DEM", "dem.rds"))  
+dem  <- readRDS(here::here("data-raw", "DEM", "dem_rast.rds"))            
+river <- rivermile::sprague_river     
+river_v <- vect(st_transform(river, crs(dem)))
+
+# buffer river slightly so floodplain area included
+river_buf <- buffer(river_v, 1000)  # meters? 
+
+# crop DEM to buffer
+dem_crop <- crop(dem, river_buf)
+dem_crop <- mask(dem_crop, river_buf)
+
+# now rasterize
+river_r <- rasterize(river_v, dem_crop, field = 1)
+
+# 2) choose a water surface elevation (example: 2.0 feet(?) above a reference river elevation)
+# If you have gage WSE, use that directly (absolute elevation).
+river_elev <- global(mask(dem_crop, river_r), "mean", na.rm = TRUE)[1,1]
+wse <- river_elev + 2.0
+
+# 3) initial inundation ("bathtub")
+wet0 <- dem_crop <= wse 
+
+# 4) keep only wet cells connected to the river
+#    (seed = river cells; then expand through adjacent wet cells)
+seed <- !is.na(river_r)
+wet_connected <- terra::patches(wet0, directions=8)  # label connected wet patches
+# find which patch IDs touch the river
+touch_ids <- unique(values(wet_connected)[values(wet_connected) > 0 & values(seed)])
+wet <- wet_connected %in% touch_ids
+
+# 5) distance-from-channel across inundated area
+dist_from_river <- distance(seed)  # planar distance in CRS units
+dist_inundated <- mask(dist_from_river, wet)
+
+# summary: max travel distance (in map units)
+global(dist_inundated, "max", na.rm = TRUE)
+
+```
+```{r}
+# --- Multidirectional hillshade from dem_crop ---
+slope  <- terrain(dem_crop, v = "slope",  unit = "radians")
+aspect <- terrain(dem_crop, v = "aspect", unit = "radians")
+
+# pick a few azimuths (degrees); altitude ~ 45° is a common default
+az <- c(315, 45, 90, 135, 180, 225, 270)
+
+hs_stack <- rast(lapply(az, \(a) shade(slope, aspect, angle = 45, direction = a)))
+hs_multi <- app(hs_stack, fun = mean, na.rm = TRUE)
+
+# (optional) stretch contrast a bit (simple linear stretch)
+hs_multi <- clamp(hs_multi, lower = quantile(values(hs_multi), 0.02, na.rm = TRUE),
+                            upper = quantile(values(hs_multi), 0.98, na.rm = TRUE),
+                            values = TRUE)
+
+# project to lon/lat for leaflet
+hs_ll <- project(hs_multi, "EPSG:4326", method = "bilinear")
+
+# grayscale palette
+hs_vals <- values(hs_ll, mat = FALSE)
+hs_vals <- hs_vals[is.finite(hs_vals)]
+hs_pal <- colorNumeric(gray.colors(256), domain = hs_vals, na.color = "transparent")
+
+```
+
+
+```{r}
+depth <- wse - dem_crop
+depth <- mask(depth, wet, maskvalues = 0)   # keep inundated cells only
+depth <- clamp(depth, lower = 0, values = TRUE)  # set negative depths to 0
+depth[depth == 0] <- NA                      # hide zeros for cleaner map
+
+depth_ll <- project(depth, "EPSG:4326", method = "bilinear")
+
+vals <- values(depth_ll, mat = FALSE)
+vals <- vals[is.finite(vals)]
+
+pal <- colorNumeric(
+  palette = "viridis",
+  domain  = vals,
+  na.color = "transparent"
+)
+
+wet_poly <- as.polygons(!is.na(depth_ll), dissolve = TRUE) |> st_as_sf()
+bb <- st_bbox(wet_poly)
+
+leaflet() |>
+  addProviderTiles(providers$CartoDB.Positron, group = "Positron") |>
+  addProviderTiles(providers$Esri.WorldImagery, group = "Imagery") |>
+    addRasterImage(hs_ll, colors = hs_pal, opacity = 0.8, group = "Hillshade") |>
+  addRasterImage(depth_ll, colors = pal, opacity = 0.65, group = "Depth") |>
+  addPolygons(
+    data = klamath_crops |> st_transform(4326),
+    fillColor = "green", fillOpacity = 0.4,
+    color = "darkgreen", weight = 1,
+    group = "Crops"
+  ) |>
+  addPolylines(
+    data = rivermile::all_klamath_rivers_line |> st_transform(4326),
+    color = "blue", weight = 1.5, opacity = 0.5,
+    label = ~river,
+    labelOptions = labelOptions(
+      noHide = TRUE, direction = "auto", textsize = "11px",
+      style = list("color" = "navy", "font-weight" = "bold")
+    ),
+    group = "Rivers"
+  ) |>
+  addLegend(pal = pal, values = as.numeric(vals), title = "Water depth (meters)", opacity = 1) |>
+  addLayersControl(
+    baseGroups = c("Positron", "Imagery"),
+    overlayGroups = c("Hillshade", "Depth", "Crops", "Rivers"),
+    options = layersControlOptions(collapsed = FALSE)
+  ) |> 
+  fitBounds(
+    lng1 = as.numeric(bb["xmin"]),
+    lat1 = as.numeric(bb["ymin"]),
+    lng2 = as.numeric(bb["xmax"]),
+    lat2 = as.numeric(bb["ymax"])
+  )
 ```

@@ -1,0 +1,103 @@
+---
+title: "Untitled"
+author: "Maddee Rubenson (FlowWest)"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(sf)
+library(tidyverse)
+library(leaflet)
+```
+
+```{r include=FALSE}
+klamath_basin <- st_read('klamath_basin_outline/R8_FAC_Klamath_Basin_WFL1.shp')
+ggplot() + 
+  geom_sf(data = klamath_basin)
+```
+
+```{r include=FALSE}
+or_field <- st_layers(here::here("data-raw", "cropET", "Appendix_6a_Field_and_HUC_Consumptive_Use_Geodatabase", "or_field_geopackage.gpkg"))
+layers <- unique(or_field$name)
+
+crop <- st_read(
+  here::here("data-raw", "cropET", "Appendix_6a_Field_and_HUC_Consumptive_Use_Geodatabase", "or_field_geopackage.gpkg"),
+  layer = "CROP"
+) |> 
+  st_transform(st_crs(klamath_basin))
+
+klamath_crops <- sf::st_intersection(crop, klamath_basin)
+
+klamath_crops |> glimpse()
+
+klamath_crops |> 
+  ggplot() + 
+  geom_sf()
+```
+
+```{r include=FALSE}
+unique(klamath_crops$ITYPE)
+
+unique(klamath_crops$CROP_2022)
+
+```
+
+## Levees
+
+**Data source: ** https://resilience.climate.gov/maps/87acff1ba86c40098b59472292de3d11/about
+
+```{r}
+
+url <- "https://services2.arcgis.com/FiaPA4ga0iQKduv3/ArcGIS/rest/services/NLD2_PUBLIC_v1/FeatureServer/0/query?where=1%3D1&outFields=*&f=geojson"
+
+nld <- st_read(url)
+
+nld_klamath <- nld |> 
+  st_transform(st_crs(klamath_basin)) |> 
+  sf::st_intersection(klamath_basin) |> 
+  janitor::clean_names()
+
+ggplot() + 
+  geom_sf(data = klamath_basin) + 
+  geom_sf(data = nld_klamath) 
+```
+```{r}
+leaflet() |>
+  addProviderTiles(providers$CartoDB.Positron, group = "Light") |>
+  addProviderTiles(providers$Esri.WorldImagery, group = "Imagery") |>
+  addPolygons(
+    data = klamath_crops |> st_transform(4326),
+    fillColor = "green",
+    fillOpacity = 0.4,
+    color = "darkgreen",
+    weight = 1,
+    group = "Crops"
+  ) |>
+  addPolylines(
+    data = rivermile::all_klamath_rivers_line,
+    color = "blue",
+    weight = 1.5,
+    opacity = 0.5,  
+    label = ~river, 
+    labelOptions = labelOptions(
+      noHide = TRUE,         
+      direction = "auto",
+      textsize = "11px",
+      style = list(
+        "color" = "navy",
+        "font-weight" = "bold"
+      )
+    ),
+    group = "Rivers"
+  ) |>
+  addLayersControl(
+    baseGroups = c("Light", "Imagery"),
+    overlayGroups = c("Crops", "Rivers"),
+    options = layersControlOptions(collapsed = FALSE)
+  )
+  
+
+```

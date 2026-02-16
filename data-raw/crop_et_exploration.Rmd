@@ -15,29 +15,59 @@ library(terra)
 
 ```
 
-```{r include=FALSE}
-klamath_basin <- st_read('klamath_basin_outline/R8_FAC_Klamath_Basin_WFL1.shp')
-ggplot() + 
-  geom_sf(data = klamath_basin)
-```
+## Objective: 
+
+Evaluate how the removal of levees and dikes along the Sprague and Williamson Rivers may influence hydrologic connectivity, floodplain inundation patterns, and potential implications for water availability and agricultural lands.
+
 
 ```{r include=FALSE}
+klamath_basin <- st_read('klamath_basin_outline/R8_FAC_Klamath_Basin_WFL1.shp')
+```
+### Read in Consumptive Use/Field data 
+
+This data comes from Desert Research Institute: https://www.dri.edu/project/owrd-et/. The study provides a long-term record of monthly and annual satellite-based actual crop ET and consumptive use of irrigation water, potential crop ET and irrigation water requirements, applied irrigation water, and open water evaporation estimates for all major water bodies within the Oregon hydrographic area. 
+
+
+```{r eval=FALSE, include=FALSE}
 or_field <- st_layers(here::here("data-raw", "cropET", "Appendix_6a_Field_and_HUC_Consumptive_Use_Geodatabase", "or_field_geopackage.gpkg"))
 layers <- unique(or_field$name)
 
+# Mode of CDL classification
 crop <- st_read(
   here::here("data-raw", "cropET", "Appendix_6a_Field_and_HUC_Consumptive_Use_Geodatabase", "or_field_geopackage.gpkg"),
   layer = "CROP"
 ) |> 
   st_transform(st_crs(klamath_basin))
 
+# Monthly ensemble actual ET volume in acre-feet
+et_volume <- st_read(
+  here::here("data-raw", "cropET", "Appendix_6a_Field_and_HUC_Consumptive_Use_Geodatabase", "or_field_geopackage.gpkg"),
+  layer = "ET_VOLUME"
+) |> 
+  st_transform(st_crs(klamath_basin))
+
+# Monthly irrigation consumptive use volume in acre-feet (OpenET ensemble actual ET volume minus ET Demands Prz volume)
+irr_cu_volume <- st_read(
+  here::here("data-raw", "cropET", "Appendix_6a_Field_and_HUC_Consumptive_Use_Geodatabase", "or_field_geopackage.gpkg"),
+  layer = "IRR_CU_VOLUME"
+) |> 
+  st_transform(st_crs(klamath_basin))
+
+crop_crosswalk <- readxl::read_excel(here::here("data-raw", "cropET", "Appendix_4_CDL_ETDemands_crosswalk.xlsx"), skip = 1) |> janitor::clean_names()
+
 klamath_crops <- sf::st_intersection(crop, klamath_basin)
+klamath_et <- sf::st_intersection(et_volume, klamath_basin)
+klamath_irr_vol <- sf::st_intersection(irr_cu_volume, klamath_basin)
 
-klamath_crops |> glimpse()
+saveRDS(klamath_crops, here::here("data-raw", "klamath_crops.rds"))
+saveRDS(klamath_et, here::here("data-raw", "klamath_et.rds"))
+saveRDS(klamath_irr_vol, here::here("data-raw", "klamath_irr_vol.rds"))
+```
 
-klamath_crops |> 
-  ggplot() + 
-  geom_sf()
+```{r}
+klamath_crops <- read_rds(here::here("data-raw", "klamath_crops.rds"))
+klamath_et <- read_rds(here::here("data-raw", "klamath_et.rds"))
+klamath_irr_vol <- read_rds(here::here("data-raw", "klamath_irr_vol.rds"))
 ```
 
 ```{r include=FALSE}
@@ -47,11 +77,14 @@ unique(klamath_crops$CROP_2022)
 
 ```
 
-## Levees
+### Levees
 
 **Data source: ** https://resilience.climate.gov/maps/87acff1ba86c40098b59472292de3d11/about
 
-```{r}
+This data source was not included due to its limited spatial granularity within the Klamath Basin and the absence of coverage in the Upper Basin.
+
+
+```{r echo=TRUE}
 
 url <- "https://services2.arcgis.com/FiaPA4ga0iQKduv3/ArcGIS/rest/services/NLD2_PUBLIC_v1/FeatureServer/0/query?where=1%3D1&outFields=*&f=geojson"
 
@@ -64,9 +97,10 @@ nld_klamath <- nld |>
 
 ggplot() + 
   geom_sf(data = klamath_basin) + 
-  geom_sf(data = nld_klamath) 
+  geom_sf(data = nld_klamath) +
+  theme_minimal()
 ```
-```{r}
+```{r eval=FALSE, include=FALSE}
 leaflet() |>
   addProviderTiles(providers$CartoDB.Positron, group = "Light") |>
   addProviderTiles(providers$Esri.WorldImagery, group = "Imagery") |>
@@ -104,15 +138,11 @@ leaflet() |>
 
 ```
 
-## DEM
+### DEM
 
-Download the DEM using the `elevatr` package
+The DEM was downloaded using the `elevatr` package. Elevation values are in meters. We also have access to higher-resolution DEM and bathymetric datasets should further analysis be warranted. The results presented here are exploratory and currently just for the Sprague River. 
 
-DEM is in meters.
-
-We have access to a high resolution DEM and bathymetric dataset if we want to continue this route. The following is exploratory. 
-
-```{r eval=FALSE, include=FALSE}
+```{r eval=FALSE}
 library(elevatr)
 library(terra)
 
@@ -127,6 +157,10 @@ dem <- get_elev_raster(
 dem_rast <- rast(dem)
 plot(dem_rast)
 
+dem_wrap <- terra::wrap(dem_rast)
+saveRDS(dem_wrap, here::here("data-raw", "DEM", "dem_wrap.rds"))
+
+
 saveRDS(dem, here::here("data-raw", "DEM", "dem.rds"))
 saveRDS(dem_rast, here::here("data-raw", "DEM", "dem_rast.rds"))
 
@@ -137,16 +171,18 @@ The bathtub approach is a simple DEM-based method used to approximate floodplain
 
 ```{r}
 # inputs
-#dem_raw <- readRDS(here::here("data-raw", "DEM", "dem.rds"))  
-dem  <- readRDS(here::here("data-raw", "DEM", "dem_rast.rds"))            
+#dem_raw <- read_rds(here::here("data-raw", "DEM", "dem.rds"))  
+# dem  <- read_rds(here::here("data-raw", "DEM", "dem_rast.rds"))  
+dem_wrap <- terra::unwrap(read_rds(here::here("data-raw", "DEM", "dem_wrap.rds")))
+
 river <- rivermile::sprague_river     
-river_v <- vect(st_transform(river, crs(dem)))
+river_v <- vect(st_transform(river, crs(dem_wrap)))
 
 # buffer river slightly so floodplain area included
-river_buf <- buffer(river_v, 1000)  # meters? 
+river_buf <- buffer(river_v, 1000)  # meters
 
 # crop DEM to buffer
-dem_crop <- crop(dem, river_buf)
+dem_crop <- crop(dem_wrap, river_buf)
 dem_crop <- mask(dem_crop, river_buf)
 
 # now rasterize
@@ -173,37 +209,8 @@ dist_from_river <- distance(seed)  # planar distance in CRS units
 dist_inundated <- mask(dist_from_river, wet)
 
 # summary: max travel distance (in map units)
-global(dist_inundated, "max", na.rm = TRUE)
+# global(dist_inundated, "max", na.rm = TRUE)
 
-```
-```{r}
-# --- Multidirectional hillshade from dem_crop ---
-slope  <- terrain(dem_crop, v = "slope",  unit = "radians")
-aspect <- terrain(dem_crop, v = "aspect", unit = "radians")
-
-# pick a few azimuths (degrees); altitude ~ 45° is a common default
-az <- c(315, 45, 90, 135, 180, 225, 270)
-
-hs_stack <- rast(lapply(az, \(a) shade(slope, aspect, angle = 45, direction = a)))
-hs_multi <- app(hs_stack, fun = mean, na.rm = TRUE)
-
-# (optional) stretch contrast a bit (simple linear stretch)
-hs_multi <- clamp(hs_multi, lower = quantile(values(hs_multi), 0.02, na.rm = TRUE),
-                            upper = quantile(values(hs_multi), 0.98, na.rm = TRUE),
-                            values = TRUE)
-
-# project to lon/lat for leaflet
-hs_ll <- project(hs_multi, "EPSG:4326", method = "bilinear")
-
-# grayscale palette
-hs_vals <- values(hs_ll, mat = FALSE)
-hs_vals <- hs_vals[is.finite(hs_vals)]
-hs_pal <- colorNumeric(gray.colors(256), domain = hs_vals, na.color = "transparent")
-
-```
-
-
-```{r}
 depth <- wse - dem_crop
 depth <- mask(depth, wet, maskvalues = 0)   # keep inundated cells only
 depth <- clamp(depth, lower = 0, values = TRUE)  # set negative depths to 0
@@ -213,6 +220,25 @@ depth_ll <- project(depth, "EPSG:4326", method = "bilinear")
 
 vals <- values(depth_ll, mat = FALSE)
 vals <- vals[is.finite(vals)]
+
+```
+
+### Sprague River Restoration Dataset
+
+**data source**: https://data.riverscapes.net/rv/53f2c2a3-3324-4b34-94cc-2a3af2262c8f?do=1&lo=0&vm=VB_Access&bl=SAT&vp=-121.212807%7E42.421806%7E10.657
+
+```{r}
+off_channel_rearing <- st_read("../../klamathHabitatData/data-raw/PBR_Planning_Model_-_Bespoke-Sprague_River_PBR_Planning_Model/05_Restoration/02_Restoration_Space/Off_Channel_Rearing_Habitat.shp")
+
+wetland_floodplain <- st_read("../../klamathHabitatData/data-raw/PBR_Planning_Model_-_Bespoke-Sprague_River_PBR_Planning_Model/05_Restoration/02_Restoration_Space/wetland_floodplain_corridor.shp")
+
+forage_area <- st_read("../../klamathHabitatData/data-raw/PBR_Planning_Model_-_Bespoke-Sprague_River_PBR_Planning_Model/05_Restoration/02_Restoration_Space/Forage_Area.shp")
+
+
+```
+
+```{r}
+
 
 pal <- colorNumeric(
   palette = "viridis",
@@ -226,8 +252,13 @@ bb <- st_bbox(wet_poly)
 leaflet() |>
   addProviderTiles(providers$CartoDB.Positron, group = "Positron") |>
   addProviderTiles(providers$Esri.WorldImagery, group = "Imagery") |>
-    addRasterImage(hs_ll, colors = hs_pal, opacity = 0.8, group = "Hillshade") |>
   addRasterImage(depth_ll, colors = pal, opacity = 0.65, group = "Depth") |>
+  addPolygons(data = wetland_floodplain |> st_transform(4326),
+              fillColor = "orange", fillOpacity = 0.5,
+              color = "darkred", weight = 1, group = "Sprague RR Wetland") |> 
+  addPolygons(data = off_channel_rearing |> st_transform(4326),
+              fillColor = "brown", fillOpacity = 0.5,
+              color = "darkgrey", weight = 1, group = "Sprague RR Off-Channel Rearing") |> 
   addPolygons(
     data = klamath_crops |> st_transform(4326),
     fillColor = "green", fillOpacity = 0.4,
@@ -247,7 +278,7 @@ leaflet() |>
   addLegend(pal = pal, values = as.numeric(vals), title = "Water depth (meters)", opacity = 1) |>
   addLayersControl(
     baseGroups = c("Positron", "Imagery"),
-    overlayGroups = c("Hillshade", "Depth", "Crops", "Rivers"),
+    overlayGroups = c("Sprague RR Wetland", "Sprague RR Off-Channel Rearing", "Depth", "Crops", "Rivers"),
     options = layersControlOptions(collapsed = FALSE)
   ) |> 
   fitBounds(
@@ -257,3 +288,176 @@ leaflet() |>
     lat2 = as.numeric(bb["ymax"])
   )
 ```
+
+### Compare methodolgoies 
+
+The Sprague River resotoraton dataset includes wetland floodplain and I want to compare the total acreage of their analysis to the "Bath Tub" method. 
+
+```{r}
+sprague_acres <- wetland_floodplain |> 
+  mutate(acres = area_sqm / 4046.86) |> # to acres 
+  pull(acres)
+
+```
+
+```{r}
+wet_cells <- global(!is.na(depth_ll), "sum", na.rm = TRUE)[1,1]
+cell_area <- cellSize(depth_ll, unit = "m")   # SAFE for lat/long rasters
+total_area_m2 <- global(cell_area * (!is.na(depth_ll)), "sum", na.rm = TRUE)[1,1]
+bathtub_acres <- total_area_m2 / 4046.8564224
+```
+
+The Sprague Restoration analysis reported: `r sprague_acres` acres. 
+The Bath Tub DEM approach reported: `r bathtub_acres` acres. 
+
+
+```{r}
+knitr::knit_exit()
+```
+
+## Wetlands 
+
+Pre-process
+```{r}
+# choose a local projected CRS for distance/area (example: UTM)
+target_crs <- "EPSG:26910"
+
+#dem_p <- project(dem, target_crs)
+#saveRDS(dem_p, here::here("data-raw", "DEM", "dem_p.rds"))
+dem_p <- readRDS(here::here("data-raw", "DEM", "dem_p.rds"))
+river_p <- st_transform(river, target_crs) |> vect()
+
+# Limit to a corridor / floodplain to keep rasters small
+river_buf <- buffer(river_p, 2000)          # tweak to your corridor width
+dem_c <- crop(dem_p, river_buf) |> mask(river_buf)
+
+# Optionally aggregate to 2–5 m for speed
+# dem_c <- aggregate(dem_c, fact = 2)         # if original is 1 m -> 2 m
+
+
+```
+
+build inundation mask for activated space 
+
+```{r eval=FALSE, include=FALSE}
+make_inundation <- function(dem_r, river_geom, wse) {
+  # river raster seed on DEM grid
+  river_r <- rasterize(river_geom, dem_r, field = 1, background = NA)
+
+  wet0 <- dem_r <= wse
+  seed <- !is.na(river_r)
+
+  # connected-component labeling of wet cells
+  patch <- patches(wet0, directions = 8)
+
+  # keep only patch IDs that touch the river seed
+  ids <- unique(values(patch)[values(seed)])
+  wet <- patch %in% ids
+
+  list(wet = wet, river_r = river_r)
+}
+
+activated_acres <- function(wet_r, dem_r) {
+  # wet_r is logical/0-1 on same grid as dem_r
+  cell_area_m2 <- prod(res(dem_r))
+  wet_cells <- global(wet_r, "sum", na.rm = TRUE)[1, 1]
+  (wet_cells * cell_area_m2) / 4046.8564224
+}
+
+
+```
+
+compute depth + activated area for a given WSE (scenario)
+
+```{r eval=FALSE, include=FALSE}
+one <- make_inundation(dem_c, river_p, wse = 1262.4)   # example WSE
+
+wet   <- one$wet
+depth <- (1262.4 - dem_c) |> mask(wet, maskvalues = 0) |> clamp(lower = 0, values = TRUE)
+depth[depth == 0] <- NA
+
+# activated space (area)
+cell_area_m2 <- prod(res(dem_c))
+activated_area_m2 <- global(wet, "sum", na.rm = TRUE)[1,1] * cell_area_m2
+activated_area_ac  <- activated_area_m2 / 4046.8564224
+activated_area_ac
+
+
+```
+
+Hyperperiod 
+
+```{r}
+# dummy wse_df
+wse_df <- tibble(
+  date = seq.Date(as.Date("2020-01-01"), as.Date("2020-12-31"), by = "day"),
+  wse  = runif(length(date), min = 800, max = 1500)
+)
+```
+
+```{r eval=FALSE, include=FALSE}
+# wse_df: columns date, wse
+# Keep the window you care about (example: Jan–May)
+wse_jan_may <- wse_df |>
+  mutate(date = as.Date(date)) |>
+  filter(month(date) %in% 1:5) |>
+  arrange(date)
+
+wet_list <- lapply(wse_jan_may$wse, \(w) make_inundation(dem_c, river_p, w)$wet)
+wet_stack <- rast(wet_list)
+names(wet_stack) <- as.character(wse_jan_may$date)
+
+# days inundated in the period
+days_wet <- app(wet_stack, fun = sum, na.rm = TRUE)
+
+# fraction of timesteps wet (0–1)
+frac_wet <- days_wet / nlyr(wet_stack)
+
+# activated space in the period: union across timesteps
+activated_union <- app(wet_stack, fun = max, na.rm = TRUE)
+
+
+```
+
+
+
+```{r}
+
+make_inundation <- function(dem_r, river_geom, wse) {
+  river_r <- rasterize(river_geom, dem_r, field = 1, background = NA)
+
+  wet0  <- dem_r <= wse
+  seed  <- !is.na(river_r)
+  patch <- patches(wet0, directions = 8)
+
+  ids <- unique(values(patch)[values(seed)])
+  patch %in% ids
+}
+
+activated_acres <- function(wet_r, dem_r) {
+  cell_area_m2 <- prod(res(dem_r))
+  wet_cells <- global(wet_r, "sum", na.rm = TRUE)[1, 1]
+  (wet_cells * cell_area_m2) / 4046.8564224
+}
+
+activated_acres_by_month <- wse_df |>
+  mutate(
+    date  = as.Date(date),
+    month = month(date)
+  ) |>
+  filter(!is.na(wse)) |>
+  group_by(month, year = year(date)) |>
+  rowwise() |>
+  mutate(
+    activated_acres = activated_acres(
+      make_inundation(dem_c, river_p, wse),
+      dem_c
+    )
+  ) |>
+  ungroup()
+
+activated_acres_by_month
+
+```
+
+

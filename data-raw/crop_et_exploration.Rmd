@@ -1,12 +1,16 @@
 ---
-title: "Untitled"
-author: "Maddee Rubenson (FlowWest)"
+title: "Wetland and Floodplain Inundation Mapping"
+author: "Maddee Wiggins (FlowWest)"
 date: "`r Sys.Date()`"
 output: html_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
 
 library(sf)
 library(tidyverse)
@@ -15,18 +19,17 @@ library(terra)
 
 ```
 
-## Objective: 
+## Objective
 
 Evaluate how the removal of levees and dikes along the Sprague and Williamson Rivers may influence hydrologic connectivity, floodplain inundation patterns, and potential implications for water availability and agricultural lands.
-
 
 ```{r include=FALSE}
 klamath_basin <- st_read('klamath_basin_outline/R8_FAC_Klamath_Basin_WFL1.shp')
 ```
-### Read in Consumptive Use/Field data 
 
-This data comes from Desert Research Institute: https://www.dri.edu/project/owrd-et/. The study provides a long-term record of monthly and annual satellite-based actual crop ET and consumptive use of irrigation water, potential crop ET and irrigation water requirements, applied irrigation water, and open water evaporation estimates for all major water bodies within the Oregon hydrographic area. 
+### Read in Consumptive Use/Field data
 
+This data comes from Desert Research Institute: <https://www.dri.edu/project/owrd-et/>. The study provides a long-term record of monthly and annual satellite-based actual crop ET and consumptive use of irrigation water, potential crop ET and irrigation water requirements, applied irrigation water, and open water evaporation estimates for all major water bodies within the Oregon hydrographic area.
 
 ```{r eval=FALSE, include=FALSE}
 or_field <- st_layers(here::here("data-raw", "cropET", "Appendix_6a_Field_and_HUC_Consumptive_Use_Geodatabase", "or_field_geopackage.gpkg"))
@@ -79,10 +82,9 @@ unique(klamath_crops$CROP_2022)
 
 ### Levees
 
-**Data source: ** https://resilience.climate.gov/maps/87acff1ba86c40098b59472292de3d11/about
+**Data source:** <https://resilience.climate.gov/maps/87acff1ba86c40098b59472292de3d11/about>
 
-This data source was not included due to its limited spatial granularity within the Klamath Basin and the absence of coverage in the Upper Basin.
-
+This data source was not included due to its limited spatial granularity within the Klamath Basin and the absence of coverage in the Upper Basin. There is another levee data source in the Sprague River Restoration dataset but we have not included it in this report. It can be added to future analyses. 
 
 ```{r echo=TRUE}
 
@@ -100,47 +102,10 @@ ggplot() +
   geom_sf(data = nld_klamath) +
   theme_minimal()
 ```
-```{r eval=FALSE, include=FALSE}
-leaflet() |>
-  addProviderTiles(providers$CartoDB.Positron, group = "Light") |>
-  addProviderTiles(providers$Esri.WorldImagery, group = "Imagery") |>
-  addPolygons(
-    data = klamath_crops |> st_transform(4326),
-    fillColor = "green",
-    fillOpacity = 0.4,
-    color = "darkgreen",
-    weight = 1,
-    group = "Crops"
-  ) |>
-  addPolylines(
-    data = rivermile::all_klamath_rivers_line,
-    color = "blue",
-    weight = 1.5,
-    opacity = 0.5,  
-    label = ~river, 
-    labelOptions = labelOptions(
-      noHide = TRUE,         
-      direction = "auto",
-      textsize = "11px",
-      style = list(
-        "color" = "navy",
-        "font-weight" = "bold"
-      )
-    ),
-    group = "Rivers"
-  ) |>
-  addLayersControl(
-    baseGroups = c("Light", "Imagery"),
-    overlayGroups = c("Crops", "Rivers"),
-    options = layersControlOptions(collapsed = FALSE)
-  )
-  
-
-```
 
 ### DEM
 
-The DEM was downloaded using the `elevatr` package. Elevation values are in meters. We also have access to higher-resolution DEM and bathymetric datasets should further analysis be warranted. The results presented here are exploratory and currently just for the Sprague River. 
+The DEM was downloaded using the `elevatr` package. Elevation values are in meters. We also have access to higher-resolution DEM and bathymetric datasets should further analysis be warranted. The results presented here are exploratory and currently just for the Sprague River.
 
 ```{r eval=FALSE}
 library(elevatr)
@@ -165,7 +130,8 @@ saveRDS(dem, here::here("data-raw", "DEM", "dem.rds"))
 saveRDS(dem_rast, here::here("data-raw", "DEM", "dem_rast.rds"))
 
 ```
-## Map Floodplain Inundation 
+
+## Map Floodplain Inundation
 
 The bathtub approach is a simple DEM-based method used to approximate floodplain inundation by comparing terrain elevation to a specified water surface elevation (WSE). In this framework, the landscape is treated as if water fills the topography like a rising bathtub: all cells in the DEM with elevations lower than the assumed WSE are classified as inundated. To improve realism, the analysis typically restricts inundation to areas hydraulically connected to the river channel, which prevents isolated depressions from being incorrectly labeled as flooded. Because it relies only on elevation and an assumed stage, the bathtub method is computationally efficient and well suited for scenario screening, visualization, and communication of potential flood extents. However, it does not simulate hydraulic processes such as flow momentum, roughness, backwater effects, or levee overtopping, and therefore represents a static approximation rather than a physically dynamic flood model.
 
@@ -225,7 +191,7 @@ vals <- vals[is.finite(vals)]
 
 ### Sprague River Restoration Dataset
 
-**data source**: https://data.riverscapes.net/rv/53f2c2a3-3324-4b34-94cc-2a3af2262c8f?do=1&lo=0&vm=VB_Access&bl=SAT&vp=-121.212807%7E42.421806%7E10.657
+**data source**: <https://data.riverscapes.net/rv/53f2c2a3-3324-4b34-94cc-2a3af2262c8f?do=1&lo=0&vm=VB_Access&bl=SAT&vp=-121.212807%7E42.421806%7E10.657>
 
 ```{r}
 off_channel_rearing <- st_read("../../klamathHabitatData/data-raw/PBR_Planning_Model_-_Bespoke-Sprague_River_PBR_Planning_Model/05_Restoration/02_Restoration_Space/Off_Channel_Rearing_Habitat.shp")
@@ -233,13 +199,35 @@ off_channel_rearing <- st_read("../../klamathHabitatData/data-raw/PBR_Planning_M
 wetland_floodplain <- st_read("../../klamathHabitatData/data-raw/PBR_Planning_Model_-_Bespoke-Sprague_River_PBR_Planning_Model/05_Restoration/02_Restoration_Space/wetland_floodplain_corridor.shp")
 
 forage_area <- st_read("../../klamathHabitatData/data-raw/PBR_Planning_Model_-_Bespoke-Sprague_River_PBR_Planning_Model/05_Restoration/02_Restoration_Space/Forage_Area.shp")
+```
 
+### Compare methodologies
+
+The Sprague River restoration dataset includes mapped wetland and floodplain areas. We compare the total acreage from this analysis with inundation extent estimated using the bathtub method.
+
+```{r include=FALSE}
+sprague_acres <- wetland_floodplain |> 
+  mutate(acres = area_sqm / 4046.86) |> # to acres 
+  pull(acres)
 
 ```
 
-```{r}
+```{r include=FALSE}
+wet_cells <- global(!is.na(depth_ll), "sum", na.rm = TRUE)[1,1]
+cell_area <- cellSize(depth_ll, unit = "m")   # SAFE for lat/long rasters
+total_area_m2 <- global(cell_area * (!is.na(depth_ll)), "sum", na.rm = TRUE)[1,1]
+bathtub_acres <- total_area_m2 / 4046.8564224
+```
 
+-   The Sprague Restoration analysis reported: `r round(sprague_acres, 0)` acres.
 
+-   The Bath Tub DEM approach reported: `r round(bathtub_acres, 0)` acres.
+
+### Exploration Map 
+
+The following map includes multiple layers. Key visual elements include (1) a comparison of wetland extent from the Sprague River Restoration analysis and the bathtub approach, and (2) identification of agricultural fields that may be taken out of production under each scenario.
+
+```{r echo=FALSE}
 pal <- colorNumeric(
   palette = "viridis",
   domain  = vals,
@@ -289,35 +277,18 @@ leaflet() |>
   )
 ```
 
-### Compare methodolgoies 
+## Discussion/Caveats
 
-The Sprague River resotoraton dataset includes wetland floodplain and I want to compare the total acreage of their analysis to the "Bath Tub" method. 
-
-```{r}
-sprague_acres <- wetland_floodplain |> 
-  mutate(acres = area_sqm / 4046.86) |> # to acres 
-  pull(acres)
-
-```
-
-```{r}
-wet_cells <- global(!is.na(depth_ll), "sum", na.rm = TRUE)[1,1]
-cell_area <- cellSize(depth_ll, unit = "m")   # SAFE for lat/long rasters
-total_area_m2 <- global(cell_area * (!is.na(depth_ll)), "sum", na.rm = TRUE)[1,1]
-bathtub_acres <- total_area_m2 / 4046.8564224
-```
-
-The Sprague Restoration analysis reported: `r sprague_acres` acres. 
-The Bath Tub DEM approach reported: `r bathtub_acres` acres. 
-
+The bathtub approach represents a simplified, elevation-based approximation of floodplain inundation and does not explicitly account for factors such as vegetation, slope, or soil conditions, all of which strongly influence wetland presence and persistence. Additionally, the specific methodology used in the Sprague River restoration analysis remains unclear, as the supporting report is not currently available for review. As a result, differences between the two approaches should be interpreted cautiously. Importantly, both methods represent a “maximum potential” wetland or floodplain inundation extent under assumed conditions, which may differ substantially from the acreage that is practically feasible or appropriate for restoration. For example, developed areas and cities (such as Coquille) would need to be excluded from inundation scenarios. Further quality control and validation are needed to ensure that the modeled extents are reasonable, particularly given the pronounced differences observed between upstream and downstream inundation patterns across the two methodologies.
 
 ```{r}
 knitr::knit_exit()
 ```
 
-## Wetlands 
+## Wetlands
 
 Pre-process
+
 ```{r}
 # choose a local projected CRS for distance/area (example: UTM)
 target_crs <- "EPSG:26910"
@@ -337,7 +308,7 @@ dem_c <- crop(dem_p, river_buf) |> mask(river_buf)
 
 ```
 
-build inundation mask for activated space 
+build inundation mask for activated space
 
 ```{r eval=FALSE, include=FALSE}
 make_inundation <- function(dem_r, river_geom, wse) {
@@ -385,7 +356,7 @@ activated_area_ac
 
 ```
 
-Hyperperiod 
+Hyperperiod
 
 ```{r}
 # dummy wse_df
@@ -418,8 +389,6 @@ activated_union <- app(wet_stack, fun = max, na.rm = TRUE)
 
 
 ```
-
-
 
 ```{r}
 
@@ -459,5 +428,3 @@ activated_acres_by_month <- wse_df |>
 activated_acres_by_month
 
 ```
-
-

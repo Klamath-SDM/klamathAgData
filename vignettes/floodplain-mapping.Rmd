@@ -1,0 +1,631 @@
+---
+title: "Floodplain Indundation Mapping"
+author: "Maddee Wiggins"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Vignette Title}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 8,
+  out.width = "100%"
+)
+
+library(sf)
+library(tidyverse)
+library(leaflet)
+library(terra)
+library(here)
+```
+
+## Overview
+
+This document describes the steps required to develop a data object designed to evaluate potential floodplain reconnection outcomes. Specifically, it includes: 1) estimates of maximum floodplain inundation assuming theoretical levee and dike removal, 2) identification of fields impacted by inundation, and 3) estimates of irrigation volumes and acres linked to fields that may be taken out of production.
+
+```{r include=FALSE}
+klamath_basin <- rivermile::klamath_hucs |> sf::st_union()
+```
+
+### Estimate Maximum Floodplain Inundation
+
+The bathtub approach is a simple DEM-based method used to approximate floodplain inundation by comparing terrain elevation to a specified water surface elevation (WSE). In this framework, the landscape is treated as if water fills the topography like a rising bathtub: all cells in the DEM with elevations lower than the assumed WSE are classified as inundated. To improve realism, the analysis typically restricts inundation to areas hydraulically connected to the river channel, which prevents isolated depressions from being incorrectly labeled as flooded. Because it relies only on elevation and an assumed stage, the bathtub method is computationally efficient and well suited for scenario screening, visualization, and communication of potential flood extents. However, it does not simulate hydraulic processes such as flow momentum, roughness, backwater effects, or levee overtopping, and therefore represents a static approximation rather than a physically dynamic flood model.
+
+**Assumptions**
+
+-   Segment lengths = 1000 meters
+
+-   WSE = mean elevation of each segment + 0.6 (calculated from the DEM)
+
+-   Slope threshold = 1% (segments that had a slope greater than 1% were removed)
+
+```{r eval=FALSE, include=FALSE}
+dem_raw <- rast(here::here("data-raw", "DEM", "dem_z12.tif"))
+dem <- project(dem_raw, "EPSG:26910")
+
+writeRaster(
+  dem,
+  here::here("data-raw", "DEM", "dem_z12_utm10.tif"),
+  overwrite = TRUE,
+  wopt = list(
+    gdal = c("COMPRESS=ZSTD", "PREDICTOR=2"),
+    datatype = "FLT4S"
+  )
+)
+```
+
+```{r}
+dem <- rast(here::here("data-raw", "DEM", "dem_z12_utm10.tif"))
+```
+
+```{r include=FALSE}
+segment_river <- function(river_sf, seg_len_m = 2000, crs_proj = "EPSG:26910") {
+
+  river_u <- river_sf |>
+    st_transform(crs_proj) |>
+    st_union()
+
+  gt <- as.character(st_geometry_type(river_u))
+  if (gt == "MULTILINESTRING") {
+    river_u <- st_line_merge(river_u)
+  }
+
+  parts <- st_cast(river_u, "LINESTRING")  
+
+  seg_list <- list()
+  k <- 1
+
+  for (p in seq_along(parts)) {
+    L <- as.numeric(st_length(parts[p]))
+    n <- max(1, ceiling(L / seg_len_m))
+    breaks <- seq(0, 1, length.out = n + 1)
+
+    segs_sfg <- lapply(seq_len(n), function(i) {
+      lwgeom::st_linesubstring(parts[p], from = breaks[i], to = breaks[i + 1])[[1]]
+    })
+
+    seg_list[[p]] <- st_sf(
+      part_id = p,
+      seg_id  = seq_len(n),
+      geometry = st_sfc(segs_sfg, crs = st_crs(parts))
+    )
+  }
+
+  segs <- do.call(rbind, seg_list)
+  segs$seg_uid <- seq_len(nrow(segs)) 
+  segs
+}
+```
+
+```{r include=FALSE}
+segment_slope_rise_run <- function(segs_sf, dem_utm) {
+  stopifnot(inherits(segs_sf, "sf"))
+  stopifnot(inherits(dem_utm, "SpatRaster"))
+
+  if (sf::st_crs(segs_sf)$wkt != terra::crs(dem_utm)) {
+    segs_sf <- sf::st_transform(segs_sf, terra::crs(dem_utm))
+  }
+
+  ends <- sf::st_cast(sf::st_boundary(segs_sf), "POINT")
+
+  ends_v <- terra::vect(ends)
+  ends_elev <- terra::extract(dem_utm, ends_v)[, 2]  
+
+  n <- nrow(segs_sf)
+  z0 <- ends_elev[seq(1, by = 2, length.out = n)]
+  z1 <- ends_elev[seq(2, by = 2, length.out = n)]
+
+  run_m <- as.numeric(sf::st_length(segs_sf))
+  rise_m <- z1 - z0
+
+  segs_sf |>
+    mutate(
+      z_start = z0,
+      z_end   = z1,
+      run_m   = run_m,
+      rise_m  = rise_m,
+      slope_m_per_m = rise_m / run_m,
+      slope_percent = 100 * (rise_m / run_m)
+    ) |>
+    select(seg_id, slope_percent, geometry) 
+}
+```
+
+```{r include=FALSE}
+inundation_polygon <- function(
+  dem,                 
+  river_sf,            
+  wse = NULL,          
+  stage_m = 0.6,       
+  buffer_m = 1000,     
+  crs_proj = "EPSG:26910"  
+) {
+  stopifnot(inherits(dem, "SpatRaster"))
+  stopifnot(inherits(river_sf, "sf"))
+
+  dem_p <- dem
+  river_p <- sf::st_transform(river_sf, crs_proj)
+
+  river_geom <- river_p |>
+    sf::st_union()
+
+  river_buf <- sf::st_buffer(river_geom, buffer_m) |> sf::st_make_valid()
+  river_buf_v <- terra::vect(river_buf)
+
+  dem_c <- terra::crop(dem_p, river_buf_v) |> terra::mask(river_buf_v)
+
+  river_v <- terra::vect(sf::st_as_sf(river_geom))
+  river_r <- terra::rasterize(river_v, dem_c, field = 1, background = NA)
+
+  if (is.null(wse)) {
+    river_elev_mean <- terra::global(terra::mask(dem_c, river_r), "mean", na.rm = TRUE)[1, 1]
+    wse <- river_elev_mean + stage_m
+  }
+
+  wet0 <- dem_c <= wse
+
+  wet0_1na <- terra::ifel(wet0, 1, NA)
+  wet_patches <- terra::patches(wet0_1na, directions = 8)
+
+  patch_on_river <- terra::mask(wet_patches, river_r)
+
+  touch_ids <- unique(terra::values(patch_on_river))
+  touch_ids <- touch_ids[!is.na(touch_ids) & touch_ids > 0]
+  touch_ids <- touch_ids[!is.na(touch_ids) & touch_ids > 0]
+
+  wet_connected <- wet_patches %in% touch_ids
+
+  wet_poly_v <- terra::as.polygons(wet_connected, dissolve = TRUE, na.rm = TRUE)
+
+  wet_poly_v <- wet_poly_v[wet_poly_v[[1]] == 1, ]
+
+  wet_poly_sf <- sf::st_as_sf(wet_poly_v)
+
+  inund_m2 <- sum(as.numeric(sf::st_area(wet_poly_sf)), na.rm = TRUE)
+  inund_ac <- inund_m2 / 4046.8564224
+
+  list(
+    inundation_polygon = wet_poly_sf,
+    wse_used = wse,
+    acres_inundated = inund_ac
+  )
+}
+
+# out <- inundation_polygon(dem, river_sf, wse = NULL, stage_m = 0.6, buffer_m = 1000)
+```
+
+```{r include=FALSE}
+run_inundation_segments <- function(dem, river_sf,
+                                    seg_len_m = 1000,
+                                    stage_m = 0.6,
+                                    buffer_m = 2000,
+                                    wse = NULL,
+                                    crs_proj = "EPSG:26910") {
+
+  segs <- segment_river(river_sf, seg_len_m = seg_len_m, crs_proj = crs_proj)
+  segs_with_slope <- segment_slope_rise_run(segs, dem)
+  print(paste0("number of segments: ", nrow(segs_with_slope)))
+  
+  # filter to slope <1 %
+  segs_for_wetland <- segs_with_slope |> 
+    filter(abs(slope_percent) <= 1) 
+  print(paste0("number of segments <1% slope: ", nrow(segs_for_wetland)))
+
+  polys <- vector("list", nrow(segs_for_wetland))
+
+  for (i in seq_len(nrow(segs_for_wetland))) {
+    res <- inundation_polygon(
+      dem = dem,
+      river_sf = segs_for_wetland[i, ],
+      wse = NULL,
+      stage_m = stage_m,
+      buffer_m = buffer_m,
+      crs_proj = crs_proj
+    )
+    if (nrow(res$inundation) > 0) polys[[i]] <- res$inundation
+  }
+
+  polys <- polys[!vapply(polys, is.null, logical(1))]
+  all_poly <- do.call(rbind, polys) |> st_make_valid()
+
+  agg_poly <- st_union(all_poly) |> st_as_sf()
+  acres <- as.numeric(st_area(agg_poly)) / 4046.8564224
+
+  list(
+    segments = segs_for_wetland,
+    inundation_aggregate = agg_poly,
+    acres_inundated = acres
+  )
+}
+
+```
+
+### Run Scott River Inundation
+
+```{r}
+river_sf <- rivermile::all_klamath_rivers_line |> filter(river == "Scott River")
+
+scott_inundation <- run_inundation_segments(dem, river_sf, wse = NULL, stage_m = 0.6, buffer_m = 1000)
+scott_inundation$acres_inundated
+```
+
+```{r echo=FALSE}
+ggplot() +
+  geom_sf(data = river_sf, color = "darkblue", alpha = 0.4) + 
+  geom_sf(data = scott_inundation$inundation_aggregate,
+          fill = "#2C7FB8", color = NA, alpha = 0.7) +
+  coord_sf(expand = FALSE) +
+  labs(
+    title = "Floodplain Inundation Extent",
+    subtitle = "Scott River",
+    caption = paste0(
+      "Total inundated area: ",
+      round(scott_inundation$acres_inundated, 1),
+      " acres"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major = element_line(color = "grey90", size = 0.2),
+    axis.title = element_blank()
+  )
+
+```
+
+### Run Sprague River Inundation
+
+```{r}
+river_sf <- rivermile::all_klamath_rivers_line |> filter(river == "Sprague River")
+
+sprague_inundation <- run_inundation_segments(dem, river_sf, wse = NULL, stage_m = 0.6, buffer_m = 1000)
+sprague_inundation$acres_inundated
+```
+
+```{r echo=FALSE}
+ggplot() +
+  geom_sf(data = river_sf, color = "darkblue", alpha = 0.4) + 
+  geom_sf(data = sprague_inundation$inundation_aggregate,
+          fill = "#2C7FB8", color = NA, alpha = 0.7) +
+  coord_sf(expand = FALSE) +
+  labs(
+    title = "Floodplain Inundation Extent",
+    subtitle = "Sprague River",
+    caption = paste0(
+      "Total inundated area: ",
+      round(sprague_inundation$acres_inundated, 1),
+      " acres"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major = element_line(color = "grey90", size = 0.2),
+    axis.title = element_blank()
+  )
+
+```
+
+### Run Williamson River Inundation
+
+```{r}
+river_sf <- rivermile::all_klamath_rivers_line |> filter(river == "Williamson River")
+
+williamson_inundation <- run_inundation_segments(dem, river_sf, wse = NULL, stage_m = 0.6, buffer_m = 1000)
+williamson_inundation$acres_inundated
+```
+
+```{r echo=FALSE}
+ggplot() +
+  geom_sf(data = river_sf, color = "darkblue", alpha = 0.4) + 
+  geom_sf(data = williamson_inundation$inundation_aggregate,
+          fill = "#2C7FB8", color = NA, alpha = 0.7) +
+  coord_sf(expand = FALSE) +
+  labs(
+    title = "Floodplain Inundation Extent",
+    subtitle = "Williamson River",
+    caption = paste0(
+      "Total inundated area: ",
+      round(williamson_inundation$acres_inundated, 1),
+      " acres"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major = element_line(color = "grey90", size = 0.2),
+    axis.title = element_blank()
+  )
+
+```
+
+### Run Wood River Inundation
+
+```{r}
+river_sf <- rivermile::all_klamath_rivers_line |> filter(river == "Wood River")
+
+wood_inundation <- run_inundation_segments(dem, river_sf, wse = NULL, stage_m = 0.6, buffer_m = 1000)
+wood_inundation$acres_inundated
+```
+
+```{r echo=FALSE}
+ggplot() +
+  geom_sf(data = river_sf, color = "darkblue", alpha = 0.4) + 
+  geom_sf(data = wood_inundation$inundation_aggregate,
+          fill = "#2C7FB8", color = NA, alpha = 0.7) +
+  coord_sf(expand = FALSE) +
+  labs(
+    title = "Floodplain Inundation Extent",
+    subtitle = "Wood River",
+    caption = paste0(
+      "Total inundated area: ",
+      round(wood_inundation$acres_inundated, 1),
+      " acres"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major = element_line(color = "grey90", size = 0.2),
+    axis.title = element_blank()
+  )
+
+```
+
+## Create data object 
+
+```{r}
+inundated_acres <- data.frame(location = c("sprague river", "scott river", 
+                                           "williamson river", "wood river"),
+                              inundated_acres = c(sprague_inundation$acres_inundated,
+                                                  scott_inundation$acres_inundated,
+                                                  williamson_inundation$acres_inundated,
+                                                  wood_inundation$acres_inundated))
+
+```
+
+```{r}
+knitr::knit_exit()
+```
+
+```{r}
+dem <- rast(here::here("data-raw", "DEM", "dem_z12.tif"))
+
+river <- rivermile::scott_river     
+river_v <- vect(st_transform(river, crs(dem)))
+
+# buffer river slightly so floodplain area included
+river_buf <- buffer(river_v, 1000)  # meters
+
+# crop DEM to buffer
+dem_crop <- crop(dem, river_buf)
+dem_crop <- mask(dem, river_buf)
+
+if (ncell(dem_crop) > 5e7) stop("dem_crop is too large to rasterize safely—coarsen or write to disk.")
+
+river_r <- terra::rasterize(
+  river_buf, dem_crop,
+  field = 1, background = NA,
+  filename = here::here("data-raw", "DEM", "river_mask.tif"),
+  overwrite = TRUE
+)
+
+# now rasterize - this only works with a small dem_crop (it works for Sprague, not Scott)
+#river_r <- terra::rasterize(river_v, dem_crop, field = 1)
+
+river_elev <- global(mask(dem_crop, river_r), "mean", na.rm = TRUE)[1,1]
+wse <- river_elev + 2.0
+
+wet0 <- dem_crop <= wse 
+
+seed <- !is.na(river_r)
+wet_connected <- terra::patches(wet0, directions=8)  # label connected wet patches
+# find which patch IDs touch the river
+touch_ids <- unique(values(wet_connected)[values(wet_connected) > 0 & values(seed)])
+wet <- wet_connected %in% touch_ids
+
+# 5) distance-from-channel across inundated area
+dist_from_river <- distance(seed)  # planar distance in CRS units
+dist_inundated <- mask(dist_from_river, wet)
+
+depth <- wse - dem_crop
+depth <- mask(depth, wet, maskvalues = 0)   # keep inundated cells only
+depth <- clamp(depth, lower = 0, values = TRUE)  # set negative depths to 0
+depth[depth == 0] <- NA                      # hide zeros for cleaner map
+
+depth_ll <- project(depth, "EPSG:4326", method = "bilinear")
+
+vals <- values(depth_ll, mat = FALSE)
+vals <- vals[is.finite(vals)]
+
+```
+
+```{r}
+# ---- terra settings: encourage on-disk processing ----
+terraOptions(
+  memfrac = 0.6,            # use ~60% of available RAM
+  progress = 1
+)
+
+# ---- inputs ----
+dem_ll <- rast(here("data-raw", "DEM", "dem_z12.tif"))
+
+river <- rivermile::sprague_river
+river_sf <- st_as_sf(river)
+
+# ---- choose a projected CRS for meters (UTM zone based on DEM center longitude) ----
+e <- ext(dem_ll)
+lon0 <- (e$xmin + e$xmax) / 2
+lat0 <- (e$ymin + e$ymax) / 2
+utm_zone <- floor((lon0 + 180) / 6) + 1
+utm_epsg <- if (lat0 >= 0) 32600 + utm_zone else 32700 + utm_zone
+utm_crs  <- paste0("EPSG:", utm_epsg)
+
+# ---- preserve "native" resolution: convert DEM degree cellsize to meters at mid-lat ----
+res_deg <- res(dem_ll)
+m_per_deg_lat <- 111320
+m_per_deg_lon <- 111320 * cos(lat0 * pi / 180)
+res_m <- c(res_deg[1] * m_per_deg_lon, res_deg[2] * m_per_deg_lat)
+
+# ---- project DEM and river to meters, keeping approx native cell size ----
+dem <- project(
+  dem_ll,
+  utm_crs,
+  method = "bilinear",
+  res = res_m
+)
+
+river_v <- vect(st_transform(river_sf, crs(dem)))
+river_v <- makeValid(river_v)
+
+# ---- buffer river (meters) ----
+river_buf <- buffer(river_v, 1000)
+river_buf <- makeValid(river_buf)
+
+# ---- crop + mask DEM to buffer, writing to disk to avoid huge in-memory rasters ----
+dem_crop_path <- here("data-raw", "DEM", "dem_crop_utm.tif")
+dem_crop <- mask(
+  crop(dem, river_buf),
+  river_buf,
+  filename = dem_crop_path,
+  overwrite = TRUE
+)
+
+# ---- rasterize river buffer mask to disk ----
+river_mask_path <- here("data-raw", "DEM", "river_mask.tif")
+river_r <- rasterize(
+  river_buf, dem_crop,
+  field = 1, background = NA,
+  filename = river_mask_path,
+  overwrite = TRUE
+)
+
+# ---- river elevation + WSE ----
+river_elev <- global(mask(dem_crop, river_r), "mean", na.rm = TRUE)[1, 1]
+wse <- river_elev + 2.0
+
+# ---- inundation mask (write to disk) ----
+wet0_path <- here("data-raw", "DEM", "wet0.tif")
+wet0 <- (dem_crop <= wse)
+wet0 <- writeRaster(wet0, wet0_path, overwrite = TRUE)
+
+# ---- connected components (patch labels) written to disk ----
+patch_path <- here("data-raw", "DEM", "wet_patches.tif")
+wet_patches <- patches(
+  wet0,
+  directions = 8,
+  filename = patch_path,
+  overwrite = TRUE
+)
+
+# ---- find patch IDs that touch the river raster (faithful + disk-safe) ----
+touch_path <- here("data-raw", "DEM", "wet_patches_touching_river.tif")
+
+touch_r <- mask(
+  wet_patches, river_r,
+  filename = touch_path,
+  overwrite = TRUE
+)
+
+# IDs of patches that overlap the river raster (non-NA)
+touch_freq <- as.data.frame(freq(touch_r))
+touch_ids <- touch_freq$value
+touch_ids <- touch_ids[!is.na(touch_ids) & touch_ids > 0]
+
+# ---- build connected inundation mask (1/NA) ----
+wet_path <- here("data-raw", "DEM", "wet_connected.tif")
+wet <- ifel(wet_patches %in% touch_ids, 1, NA,
+            filename = wet_path, overwrite = TRUE)
+
+# ---- distance-to-river (this is expensive; MUST write to disk) ----
+# distance() computes distance to nearest NON-NA cell.
+dist_path <- here("data-raw", "DEM", "dist_to_river.tif")
+dist_from_river <- distance(
+  river_r,
+  filename = dist_path,
+  overwrite = TRUE
+)
+
+dist_inund_path <- here("data-raw", "DEM", "dist_inundated.tif")
+dist_inundated <- mask(
+  dist_from_river, wet,
+  filename = dist_inund_path,
+  overwrite = TRUE
+)
+
+# ---- depth (write to disk) ----
+depth_path <- here("data-raw", "DEM", "depth_utm.tif")
+depth_masked_path <- here("data-raw", "DEM", "depth_utm_masked.tif")
+depth <- (wse - dem_crop)
+depth <- ifel(depth > 0, depth, NA,
+              filename = depth_path, overwrite = TRUE)
+depth <- mask(depth, wet,
+              filename = depth_masked_path,
+              overwrite = TRUE)
+
+# ---- project depth back to lat/long for mapping (write to disk) ----
+depth_ll_path <- here("data-raw", "DEM", "depth_ll.tif")
+depth_ll <- project(
+  depth, "EPSG:4326",
+  method = "bilinear",
+  filename = depth_ll_path,
+  overwrite = TRUE
+)
+
+
+vals <- values(depth_ll, mat = FALSE)
+vals <- vals[is.finite(vals)]
+
+```
+
+```{r}
+wet_cells <- global(!is.na(depth_ll), "sum", na.rm = TRUE)[1,1]
+cell_area <- cellSize(depth_ll, unit = "m")   # SAFE for lat/long rasters
+total_area_m2 <- global(cell_area * (!is.na(depth_ll)), "sum", na.rm = TRUE)[1,1]
+bathtub_acres <- total_area_m2 / 4046.8564224
+
+```
+
+```{r}
+pal <- colorNumeric(
+  palette = "viridis",
+  domain  = vals,
+  na.color = "transparent"
+)
+
+wet_poly <- as.polygons(!is.na(depth_ll), dissolve = TRUE) |> st_as_sf()
+bb <- st_bbox(wet_poly)
+
+leaflet() |>
+  addProviderTiles(providers$CartoDB.Positron, group = "Positron") |>
+  addProviderTiles(providers$Esri.WorldImagery, group = "Imagery") |>
+  addRasterImage(depth_ll, colors = pal, opacity = 0.65, group = "Depth") |>
+  addPolylines(
+    data = rivermile::all_klamath_rivers_line |> st_transform(4326),
+    color = "blue", weight = 1.5, opacity = 0.5,
+    label = ~river,
+    labelOptions = labelOptions(
+      noHide = TRUE, direction = "auto", textsize = "11px",
+      style = list("color" = "navy", "font-weight" = "bold")
+    ),
+    group = "Rivers"
+  ) |>
+  addLegend(pal = pal, values = as.numeric(vals), title = "Water depth (meters)", opacity = 1) |>
+  addLayersControl(
+    baseGroups = c("Positron", "Imagery"),
+    overlayGroups = c( "Depth",  "Rivers"),
+    options = layersControlOptions(collapsed = FALSE)
+  ) |> 
+  fitBounds(
+    lng1 = as.numeric(bb["xmin"]),
+    lat1 = as.numeric(bb["ymin"]),
+    lng2 = as.numeric(bb["xmax"]),
+    lat2 = as.numeric(bb["ymax"])
+  )
+
+```

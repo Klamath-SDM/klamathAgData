@@ -24,7 +24,7 @@ library(terra)
 Evaluate how the removal of levees and dikes along the Sprague and Williamson Rivers may influence hydrologic connectivity, floodplain inundation patterns, and potential implications for water availability and agricultural lands.
 
 ```{r include=FALSE}
-klamath_basin <- st_read('klamath_basin_outline/R8_FAC_Klamath_Basin_WFL1.shp')
+klamath_basin <- rivermile::klamath_hucs |> sf::st_union()
 ```
 
 ### Read in Consumptive Use/Field data
@@ -112,22 +112,49 @@ library(elevatr)
 library(terra)
 
 aoi <- klamath_basin
+if (inherits(aoi, "SpatVector")) aoi <- st_as_sf(aoi)
 
+if (inherits(aoi, "sfc")) aoi <- st_sf(geometry = aoi)
+
+aoi <- aoi |>
+  st_make_valid() |>
+  st_union() |>
+  st_as_sf() |>
+  st_set_crs(st_crs(klamath_basin)) 
+
+# This process takes a long time so we save the raster for 
+# later processing. We don't want to run this everytime. 
 dem <- get_elev_raster(
   locations = aoi,
-  z = 12,          # higher = finer (~10–30 m typical)
+  z = 12,
   clip = "locations"
 )
 
 dem_rast <- rast(dem)
 plot(dem_rast)
 
-dem_wrap <- terra::wrap(dem_rast)
-saveRDS(dem_wrap, here::here("data-raw", "DEM", "dem_wrap.rds"))
+# save raster
+out_tif <- here::here("data-raw", "DEM", "dem_z12.tif")
 
+writeRaster(
+  dem_rast,
+  out_tif,
+  overwrite = TRUE,
+  gdal = c(
+    "COMPRESS=ZSTD",        
+    "PREDICTOR=3",          
+    "TILED=YES",            
+    "BLOCKXSIZE=512",
+    "BLOCKYSIZE=512",
+    "BIGTIFF=IF_SAFER"      
+  )
+)
 
-saveRDS(dem, here::here("data-raw", "DEM", "dem.rds"))
-saveRDS(dem_rast, here::here("data-raw", "DEM", "dem_rast.rds"))
+# dem_rast <- read_rds(here::here("data-raw", "DEM", "dem_rast.rds"))
+# dem_wrap <- terra::wrap(dem_rast)
+# saveRDS(dem_wrap, here::here("data-raw", "DEM", "dem_wrap.rds"))
+# saveRDS(dem, here::here("data-raw", "DEM", "dem.rds"))
+# saveRDS(dem_rast, here::here("data-raw", "DEM", "dem_rast.rds"))
 
 ```
 
@@ -139,40 +166,43 @@ The bathtub approach is a simple DEM-based method used to approximate floodplain
 # inputs
 #dem_raw <- read_rds(here::here("data-raw", "DEM", "dem.rds"))  
 # dem  <- read_rds(here::here("data-raw", "DEM", "dem_rast.rds"))  
-dem_wrap <- terra::unwrap(read_rds(here::here("data-raw", "DEM", "dem_wrap.rds")))
+# dem_wrap <- terra::unwrap(read_rds(here::here("data-raw", "DEM", "dem_wrap.rds")))
+
+dem_raw <- rast(here::here("data-raw", "DEM", "dem_z12.tif"))
+dem <- project(dem_raw, "EPSG:26910")
 
 river <- rivermile::sprague_river     
-river_v <- vect(st_transform(river, crs(dem_wrap)))
+river_v <- vect(st_transform(river, crs(dem)))
 
 # buffer river slightly so floodplain area included
 river_buf <- buffer(river_v, 1000)  # meters
 
 # crop DEM to buffer
-dem_crop <- crop(dem_wrap, river_buf)
-dem_crop <- mask(dem_crop, river_buf)
+dem_crop <- crop(dem, river_buf) |> mask(river_buf)
 
 # now rasterize
-river_r <- rasterize(river_v, dem_crop, field = 1)
+river_r <- rasterize(river_v, dem_crop, field = 1, background = NA)
 
 # 2) choose a water surface elevation (example: 2.0 feet(?) above a reference river elevation)
 # If you have gage WSE, use that directly (absolute elevation).
 river_elev <- global(mask(dem_crop, river_r), "mean", na.rm = TRUE)[1,1]
-wse <- river_elev + 2.0
+wse <- river_elev 
 
 # 3) initial inundation ("bathtub")
 wet0 <- dem_crop <= wse 
+wet0_1na <- terra::ifel(wet0, 1, NA)
 
 # 4) keep only wet cells connected to the river
 #    (seed = river cells; then expand through adjacent wet cells)
-seed <- !is.na(river_r)
-wet_connected <- terra::patches(wet0, directions=8)  # label connected wet patches
+seed <- !is.na(river_r) & wet0
+wet_connected <- terra::patches(wet0_1na, directions=8)  # label connected wet patches
 # find which patch IDs touch the river
 touch_ids <- unique(values(wet_connected)[values(wet_connected) > 0 & values(seed)])
 wet <- wet_connected %in% touch_ids
 
 # 5) distance-from-channel across inundated area
-dist_from_river <- distance(seed)  # planar distance in CRS units
-dist_inundated <- mask(dist_from_river, wet)
+#dist_from_river <- distance(seed)  
+#dist_inundated <- mask(dist_from_river, wet)
 
 # summary: max travel distance (in map units)
 # global(dist_inundated, "max", na.rm = TRUE)
@@ -186,6 +216,161 @@ depth_ll <- project(depth, "EPSG:4326", method = "bilinear")
 
 vals <- values(depth_ll, mat = FALSE)
 vals <- vals[is.finite(vals)]
+
+```
+
+```{r eval=FALSE, include=FALSE}
+make_single_line <- function(x) {
+  x_u <- sf::st_union(x)
+
+  gt <- unique(as.character(sf::st_geometry_type(x_u)))
+  # If it's already a LINESTRING, just keep it
+  if ("LINESTRING" %in% gt && !("MULTILINESTRING" %in% gt)) {
+    return(sf::st_cast(x_u, "LINESTRING"))
+  }
+
+  # Otherwise merge multilines into lines
+  x_m <- sf::st_line_merge(sf::st_cast(x_u, "MULTILINESTRING"))
+  sf::st_cast(x_m, "LINESTRING")
+}
+
+dem_raw <- rast(here::here("data-raw", "DEM", "dem_z12.tif"))
+dem <- project(dem_raw, "EPSG:26910")
+
+
+bathtub_by_reach <- function(
+  dem_ll,                 # SpatRaster (can be lon/lat)
+  river_sf,               # sf LINESTRING/MULTILINESTRING
+  stage_m = 0.6,          # added water depth above downstream ref (meters)
+  slope_ws = 0.0003,      # water surface slope (m drop per m downstream)
+  reach_len_m = 500,      # reach length (meters)
+  reach_buffer_m = 800,   # corridor buffer (meters)
+  crs_utm = "EPSG:26910", # NAD83 / UTM 10N
+  downstream_end = c("end", "start") # which end is downstream for 0 mile
+) {
+
+  downstream_end <- match.arg(downstream_end)
+
+  # --- project DEM + river to UTM meters ---
+  #dem <- terra::project(dem_ll, crs_utm)
+  river <- st_transform(river_sf, crs_utm)
+  #river_line <- make_single_line(river)
+  river_v <- vect(st_transform(river, crs(crs_utm)))
+  
+  river_buf <- buffer(river_v, 1000)  # meters
+  dem_crop <- crop(dem, river_buf) |> mask(river_buf)
+
+  # cast to LINESTRING parts; keep longest if more than one remains
+  river_parts <- st_cast(river, "LINESTRING")
+  if (length(river_parts) > 1) {
+    river_parts <- river_parts[which.max(as.numeric(st_length(river_parts)))]
+  }
+  river_line <- river_parts
+
+  line_len <- as.numeric(st_length(river))
+
+  # --- create reach breakpoints along line ---
+  #n_reaches <- max(1, ceiling(line_len / reach_len_m))
+  n_reaches = 5
+  # points at reach boundaries (0..1)
+  breaks <- seq(0, 1, length.out = n_reaches + 1)
+
+  pts <- st_line_sample(river_line, sample = breaks) |>
+    st_cast("POINT") |>
+    st_as_sf()
+
+  coords <- st_coordinates(pts)
+
+  # distance-from-start for each breakpoint (meters)
+  dist_m <- seq(0, by = line_len / n_reaches, length.out = nrow(pts))
+  dist_m[nrow(pts)] <- line_len
+
+  # flip if downstream is the start
+  dist_downstream_m <- if (downstream_end == "start") dist_m else (line_len - dist_m)
+
+  # downstream reference elevation from DEM at river cells (approx)
+  river_r <- rasterize(river_v, dem_crop, field = 1, background = NA)
+  river_elev_ds <- global(mask(dem_crop, river_r), "min", na.rm = TRUE)[1, 1]
+
+  # WSE at each breakpoint (sloping profile)
+  wse_pts <- river_elev_ds + stage_m + slope_ws * dist_downstream_m
+
+  pts$wse <- wse_pts
+
+  # --- build reach segments (LINESTRING between consecutive points) ---
+  segs <- lapply(1:(nrow(coords) - 1), function(i) {
+    st_linestring(rbind(coords[i, ], coords[i + 1, ]))
+  })
+  reaches <- st_sf(
+    reach_id = seq_along(segs),
+    wse = (wse_pts[-nrow(pts)] + wse_pts[-1]) / 2,  # average WSE for segment
+    geometry = st_sfc(segs, crs = st_crs(river_line))
+  )
+
+  # --- prepare output rasters ---
+  wet_all   <- rast(dem_crop); values(wet_all) <- NA
+  depth_all <- rast(dem_crop); values(depth_all) <- NA
+
+  # optional per-reach acres summary
+  cell_area_m2 <- prod(res(dem_crop))
+  reach_tbl <- vector("list", nrow(reaches))
+
+  wet_all <- rast(dem_crop)
+  values(wet_all) <- 0
+  
+  for (i in seq_len(nrow(reaches))) {
+
+    # buffer corridor for this reach
+    buf_i <- st_buffer(reaches[i, ], reach_buffer_m) |> st_make_valid()
+    buf_v <- vect(buf_i)
+
+    # crop to keep it fast
+    dem_crop_i <- crop(dem_crop, buf_v) |> mask(buf_v)
+
+    # inundation within corridor using reach WSE
+    wet_i <- dem_crop_i <= reaches$wse[i]
+    wet_i_num <- ifel(wet_i, 1, 0)
+
+    # depth within corridor
+    depth_i <- reaches$wse[i] - dem_crop_i
+    depth_i <- mask(depth_i, wet_i, maskvalues = 0) |> clamp(lower = 0, values = TRUE)
+    depth_i[depth_i == 0] <- NA
+
+    # mosaic into full rasters
+    #wet_all   <- mosaic(wet_all, wet_i_num, fun = "max", na.rm = TRUE)
+    #depth_all <- mosaic(depth_all, depth_i, fun = "max", na.rm = TRUE)
+
+    # acres for this reach (within its corridor)
+    wet_cells <- global(wet_i, "sum", na.rm = TRUE)[1, 1]
+    reach_tbl[[i]] <- tibble(
+      reach_id = reaches$reach_id[i],
+      wse = reaches$wse[i],
+      inundated_acres = (wet_cells * cell_area_m2) / 4046.8564224
+    )
+  }
+
+  list(
+    #wet = wet_all,
+    #depth = depth_all,
+    reaches = reaches,
+    reach_summary = bind_rows(reach_tbl)
+  )
+}
+
+out <- bathtub_by_reach(
+  dem_ll = dem,                 # your DEM (can be EPSG:4269)
+  river_sf = rivermile::sprague_river,
+  stage_m = 0.6,                     # adjust
+  slope_ws = 0.0003,                 # adjust
+  reach_len_m = 500,
+  reach_buffer_m = 1000,
+  downstream_end = "end"             # flip if needed
+)
+
+bathtub_acres <- global(
+  cellSize(depth_ll, unit = "m") * !is.na(depth_ll),
+  "sum", na.rm = TRUE
+) [1,1] / 4046.85
 
 ```
 

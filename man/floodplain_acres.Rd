@@ -5,12 +5,21 @@
 \alias{floodplain_acres}
 \title{Estimated Maximum Floodplain Acres}
 \format{
-
+A tibble with 4 rows and 4 columns:
+\itemize{
+  \item{\code{location: }}{Name of the stream or river (Sprague River, Williamson River, Scott River, Wood River).}
+  \item{\code{inundated_acres: }}{Estimated maximum inundation acreage using the "bathtub" DEM approach.}
+  \item{\code{field_acres: }}{Estimated acreage of agricultural fields that would be impacted by inundation. Source: https://www.dri.edu/project/owrd-et/}
+  \item{\code{n_fields_touched: }}{Number of agricultural fields impacted by inundation. Source: https://www.dri.edu/project/owrd-et/}
+}
 }
 \usage{
 floodplain_acres
 }
 \description{
-This data object summarizes the theoretical maximum inundation for chosen reaches in the Klamath basin as well as the potential agricultural impacts
+This data object summarizes the theoretical maximum inundation
+for chosen reaches in the Klamath Basin as well as the potential agricultural impacts.
+See the \link[vignette("floodplain-mapping")]{Floodplain Mapping vignette} for details
+on the DEM-based inundation approach used to generate these estimates.
 }
 \keyword{datasets}

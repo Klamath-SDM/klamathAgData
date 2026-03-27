@@ -1,0 +1,795 @@
+---
+title: "Theoretical Maximum Floodplain Inundation Mapping"
+author: "Maddee Wiggins"
+date: "`r Sys.Date()`"
+output: github_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 8,
+  out.width = "100%"
+)
+
+library(sf)
+library(tidyverse)
+library(leaflet)
+library(terra)
+library(here)
+```
+
+## Overview
+
+This document describes the steps required to develop a data object designed to evaluate potential floodplain reconnection outcomes. Specifically, it includes: 1) estimates of maximum floodplain inundation assuming theoretical levee and dike removal, 2) identification of fields impacted by inundation, and 3) estimates of irrigation volumes and acres linked to fields that may be taken out of production.
+
+```{r include=FALSE}
+klamath_basin <- rivermile::klamath_hucs |> sf::st_union()
+```
+
+## Estimate Maximum Floodplain Inundation
+
+The bathtub approach is a simple DEM-based method used to approximate floodplain inundation by comparing terrain elevation to a specified water surface elevation (WSE). In this framework, the landscape is treated as if water fills the topography like a rising bathtub: all cells in the DEM with elevations lower than the assumed WSE are classified as inundated. To improve realism, the analysis typically restricts inundation to areas hydraulically connected to the river channel, which prevents isolated depressions from being incorrectly labeled as flooded. Because it relies only on elevation and an assumed stage, the bathtub method is computationally efficient and well suited for scenario screening, visualization, and communication of potential flood extents. However, it does not simulate hydraulic processes such as flow momentum, roughness, backwater effects, or levee overtopping, and therefore represents a static approximation rather than a physically dynamic flood model.
+
+**Assumptions**
+
+-   Segment lengths = 1000 meters
+
+-   WSE = mean elevation of each segment + 0.6 (calculated from the DEM)
+
+-   Slope threshold = 1% (segments that had a slope greater than 1% were removed)
+
+-   Field inundation threshold = 30% (field must overlap \> 30% to be included in the fields impacted)
+
+-   Negative irrigation volumes are set to 0
+
+```{r eval=FALSE, include=FALSE}
+# because of the large file of DEM, this must be run to store a file on your computer before running script 
+dem_raw <- rast(here::here("data-raw", "DEM", "dem_z12.tif"))
+dem <- project(dem_raw, "EPSG:26910")
+
+writeRaster(
+  dem,
+  here::here("data-raw", "DEM", "dem_z12_utm10.tif"),
+  overwrite = TRUE,
+  wopt = list(
+    gdal = c("COMPRESS=ZSTD", "PREDICTOR=2"),
+    datatype = "FLT4S"
+  )
+)
+```
+
+```{r include=FALSE}
+dem <- rast(here::here("data-raw", "DEM", "dem_z12_utm10.tif"))
+```
+
+```{r include=FALSE}
+segment_river <- function(river_sf, seg_len_m = 2000, crs_proj = "EPSG:26910") {
+  
+  river_u <- river_sf |>
+    st_transform(crs_proj) |>
+    st_union()
+  
+  gt <- as.character(st_geometry_type(river_u))
+  if (gt == "MULTILINESTRING") {
+    river_u <- st_line_merge(river_u)
+  }
+  
+  parts <- st_cast(river_u, "LINESTRING")  
+  
+  seg_list <- list()
+  k <- 1
+  
+  for (p in seq_along(parts)) {
+    L <- as.numeric(st_length(parts[p]))
+    n <- max(1, ceiling(L / seg_len_m))
+    breaks <- seq(0, 1, length.out = n + 1)
+    
+    segs_sfg <- lapply(seq_len(n), function(i) {
+      lwgeom::st_linesubstring(parts[p], from = breaks[i], to = breaks[i + 1])[[1]]
+    })
+    
+    seg_list[[p]] <- st_sf(
+      part_id = p,
+      seg_id  = seq_len(n),
+      geometry = st_sfc(segs_sfg, crs = st_crs(parts))
+    )
+  }
+  
+  segs <- do.call(rbind, seg_list)
+  segs$seg_uid <- seq_len(nrow(segs)) 
+  segs
+}
+```
+
+```{r include=FALSE}
+segment_slope_rise_run <- function(segs_sf, dem_utm) {
+  stopifnot(inherits(segs_sf, "sf"))
+  stopifnot(inherits(dem_utm, "SpatRaster"))
+  
+  if (sf::st_crs(segs_sf)$wkt != terra::crs(dem_utm)) {
+    segs_sf <- sf::st_transform(segs_sf, terra::crs(dem_utm))
+  }
+  
+  ends <- sf::st_cast(sf::st_boundary(segs_sf), "POINT")
+  
+  ends_v <- terra::vect(ends)
+  ends_elev <- terra::extract(dem_utm, ends_v)[, 2]  
+  
+  n <- nrow(segs_sf)
+  z0 <- ends_elev[seq(1, by = 2, length.out = n)]
+  z1 <- ends_elev[seq(2, by = 2, length.out = n)]
+  
+  run_m <- as.numeric(sf::st_length(segs_sf))
+  rise_m <- z1 - z0
+  
+  segs_sf |>
+    mutate(
+      z_start = z0,
+      z_end   = z1,
+      run_m   = run_m,
+      rise_m  = rise_m,
+      slope_m_per_m = rise_m / run_m,
+      slope_percent = 100 * (rise_m / run_m)
+    ) |>
+    select(seg_id, slope_percent, geometry) 
+}
+```
+
+```{r include=FALSE}
+inundation_polygon <- function(
+    dem,                 
+    river_sf,            
+    wse = NULL,          
+    stage_m = 0.6,       
+    buffer_m = 1000,     
+    crs_proj = "EPSG:26910"  
+) {
+  stopifnot(inherits(dem, "SpatRaster"))
+  stopifnot(inherits(river_sf, "sf"))
+  
+  dem_p <- dem
+  river_p <- sf::st_transform(river_sf, crs_proj)
+  
+  river_geom <- river_p |>
+    sf::st_union()
+  
+  river_buf <- sf::st_buffer(river_geom, buffer_m) |> sf::st_make_valid()
+  river_buf_v <- terra::vect(river_buf)
+  
+  dem_c <- terra::crop(dem_p, river_buf_v) |> terra::mask(river_buf_v)
+  
+  river_v <- terra::vect(sf::st_as_sf(river_geom))
+  river_r <- terra::rasterize(river_v, dem_c, field = 1, background = NA)
+  
+  if (is.null(wse)) {
+    river_elev_mean <- terra::global(terra::mask(dem_c, river_r), "mean", na.rm = TRUE)[1, 1]
+    wse <- river_elev_mean + stage_m
+  }
+  
+  wet0 <- dem_c <= wse
+  
+  wet0_1na <- terra::ifel(wet0, 1, NA)
+  wet_patches <- terra::patches(wet0_1na, directions = 8)
+  
+  patch_on_river <- terra::mask(wet_patches, river_r)
+  
+  touch_ids <- unique(terra::values(patch_on_river))
+  touch_ids <- touch_ids[!is.na(touch_ids) & touch_ids > 0]
+  touch_ids <- touch_ids[!is.na(touch_ids) & touch_ids > 0]
+  
+  wet_connected <- wet_patches %in% touch_ids
+  
+  wet_poly_v <- terra::as.polygons(wet_connected, dissolve = TRUE, na.rm = TRUE)
+  
+  wet_poly_v <- wet_poly_v[wet_poly_v[[1]] == 1, ]
+  
+  wet_poly_sf <- sf::st_as_sf(wet_poly_v)
+  
+  inund_m2 <- sum(as.numeric(sf::st_area(wet_poly_sf)), na.rm = TRUE)
+  inund_ac <- inund_m2 / 4046.8564224
+  
+  list(
+    inundation_polygon = wet_poly_sf,
+    wse_used = wse,
+    acres_inundated = inund_ac
+  )
+}
+
+# out <- inundation_polygon(dem, river_sf, wse = NULL, stage_m = 0.6, buffer_m = 1000)
+```
+
+```{r include=FALSE}
+run_inundation_segments <- function(dem, river_sf,
+                                    seg_len_m = 1000,
+                                    stage_m = 0.6,
+                                    buffer_m = 2000,
+                                    wse = NULL,
+                                    crs_proj = "EPSG:26910") {
+  
+  segs <- segment_river(river_sf, seg_len_m = seg_len_m, crs_proj = crs_proj)
+  segs_with_slope <- segment_slope_rise_run(segs, dem)
+  print(paste0("number of segments: ", nrow(segs_with_slope)))
+  
+  # filter to slope <1 %
+  segs_for_wetland <- segs_with_slope |> 
+    filter(abs(slope_percent) <= 1) 
+  print(paste0("number of segments <1% slope: ", nrow(segs_for_wetland)))
+  
+  polys <- vector("list", nrow(segs_for_wetland))
+  
+  for (i in seq_len(nrow(segs_for_wetland))) {
+    res <- inundation_polygon(
+      dem = dem,
+      river_sf = segs_for_wetland[i, ],
+      wse = NULL,
+      stage_m = stage_m,
+      buffer_m = buffer_m,
+      crs_proj = crs_proj
+    )
+    if (nrow(res$inundation) > 0) polys[[i]] <- res$inundation
+  }
+  
+  polys <- polys[!vapply(polys, is.null, logical(1))]
+  all_poly <- do.call(rbind, polys) |> st_make_valid()
+  
+  agg_poly <- st_union(all_poly) |> st_as_sf()
+  acres <- as.numeric(st_area(agg_poly)) / 4046.8564224
+  
+  list(
+    segments = segs_for_wetland,
+    inundation_aggregate = agg_poly,
+    acres_inundated = acres
+  )
+}
+
+```
+
+### Run Scott River Inundation
+
+Clip Scott River to areas of active restoration (river miles 21 - 46).
+
+```{r}
+scott_river_sf <- rivermile::scott_river |> 
+  filter(river_mile >= 21 & river_mile <= 46) |> 
+  arrange(dist_from_start_m) |>           
+  summarise(geometry = st_combine(x)) |> 
+  st_cast("LINESTRING") |> 
+  mutate(river = "Scott River") 
+
+scott_inundation <- run_inundation_segments(dem, scott_river_sf, wse = NULL, stage_m = 0.6, buffer_m = 1000)
+scott_inundation$acres_inundated
+```
+
+### Run Sprague River Inundation
+
+```{r}
+river_sf <- rivermile::all_klamath_rivers_line |> filter(river == "Sprague River")
+
+sprague_inundation <- run_inundation_segments(dem, river_sf, wse = NULL, stage_m = 0.6, buffer_m = 1000)
+sprague_inundation$acres_inundated
+```
+
+### Run Williamson River Inundation
+
+```{r}
+river_sf <- rivermile::all_klamath_rivers_line |> filter(river == "Williamson River")
+
+williamson_inundation <- run_inundation_segments(dem, river_sf, wse = NULL, stage_m = 0.6, buffer_m = 1000)
+williamson_inundation$acres_inundated
+```
+
+### Run Wood River Inundation
+
+```{r}
+river_sf <- rivermile::all_klamath_rivers_line |> filter(river == "Wood River")
+
+wood_inundation <- run_inundation_segments(dem, river_sf, wse = NULL, stage_m = 0.6, buffer_m = 1000)
+wood_inundation$acres_inundated
+```
+
+## Agricultural Fields Impacted
+
+This data comes from Desert Research Institute: <https://www.dri.edu/project/owrd-et/>. The study provides a long-term record of monthly and annual satellite-based actual crop ET and consumptive use of irrigation water, potential crop ET and irrigation water requirements, applied irrigation water, and open water evaporation estimates for all major water bodies within the Oregon hydrographic area.
+
+```{r include=FALSE}
+klamath_irr_vol <- read_rds(here::here("data-raw", "klamath_irr_vol.rds")) |> 
+  mutate(field_id = OPENET_ID) 
+```
+
+```{r include=FALSE}
+summarize_field_impacts <- function(
+    inund_poly,
+    fields_sf,
+    pct_overlap_threshold = 0  # e.g., 10 means >=10% of field area inundated
+) {
+  
+  # Align CRS
+  fields_p <- st_transform(fields_sf, st_crs(inund_poly))
+  inund_p  <- st_union(st_make_valid(inund_poly))
+  
+  # Prefilter candidate fields
+  idx <- st_intersects(fields_p, inund_p)
+  fields_touch <- fields_p[lengths(idx) > 0, ]
+  
+  if (nrow(fields_touch) == 0) {
+    return(list(
+      total_field_acres = 0,
+      n_fields_touched = 0,
+      fields_impacted = fields_touch  # empty sf
+    ))
+  }
+  
+  # Field areas
+  fields_touch <- fields_touch |>
+    mutate(field_area_m2 = as.numeric(st_area(geom)))
+  
+  # Intersection pieces
+  inter <- st_intersection(fields_touch, st_as_sf(inund_p)) |>
+    mutate(inund_area_m2 = as.numeric(st_area(geom))) |>
+    st_drop_geometry() |>
+    group_by(field_id) |>
+    summarise(
+      field_area_m2 = first(field_area_m2),
+      inund_area_m2 = sum(inund_area_m2, na.rm = TRUE),
+      pct_overlap   = 100 * inund_area_m2 / field_area_m2,
+      .groups = "drop"
+    ) |>
+    mutate(inund_area_ac = inund_area_m2 / 4046.8564224)
+  
+  # Apply threshold (percent of each field inundated)
+  inter_filt <- inter |>
+    filter(pct_overlap >= pct_overlap_threshold)
+  
+  if (nrow(inter_filt) == 0) {
+    return(list(
+      total_field_acres = 0,
+      n_fields_touched = 0,
+      fields_impacted = fields_touch[0, ] # empty sf
+    ))
+  }
+  
+  # Subset original fields to impacted + join stats
+  fields_impacted <- fields_touch |>
+    semi_join(inter_filt) |>
+    left_join(inter_filt) |>
+    mutate(
+      field_area_ac = field_area_m2 / 4046.8564224
+    )
+  
+  list(
+    total_field_acres = sum(fields_impacted$inund_area_ac, na.rm = TRUE),
+    n_fields_touched  = nrow(fields_impacted),
+    fields_impacted   = fields_impacted
+  )
+}
+
+```
+
+```{r}
+sprague_fields <- summarize_field_impacts(
+  inund_poly = sprague_inundation$inundation_aggregate,
+  fields_sf = klamath_irr_vol,
+  pct_overlap_threshold = 30
+)
+
+sprague_fields$total_field_acres
+sprague_fields$n_fields_touched
+
+williamson_fields <- summarize_field_impacts(
+  inund_poly = williamson_inundation$inundation_aggregate,
+  fields_sf = klamath_irr_vol,
+  pct_overlap_threshold = 30
+)
+
+williamson_fields$total_field_acres
+williamson_fields$n_fields_touched
+
+wood_fields <- summarize_field_impacts(
+  inund_poly = wood_inundation$inundation_aggregate,
+  fields_sf = klamath_irr_vol,
+  pct_overlap_threshold = 30
+)
+
+wood_fields$total_field_acres
+wood_fields$n_fields_touched
+```
+
+### Irrigation Volumes
+
+```{r include=FALSE}
+irrigation_vol_summary <- function(fields_impacted, location) {
+  fields_impacted |> 
+    st_drop_geometry() |>
+    select(starts_with("IRR_CU_VOLUME_")) |>
+    pivot_longer(
+      cols = everything(),
+      names_to = "colname",
+      values_to = "irr_vol_acft"
+    ) |>
+    filter(!is.na(irr_vol_acft)) |>
+    mutate(
+      irr_vol_acft = pmax(irr_vol_acft, 0),
+      month = str_extract(colname, "(?<=IRR_CU_VOLUME_)\\d{2}"),
+      year  = str_extract(colname, "(?<=_)\\d{2}(?=_acft)") |> as.numeric()
+    ) |>
+    mutate(
+      year = ifelse(year < 30, 2000 + year, 1900 + year),  
+      month = as.numeric(month)
+    ) |>
+    group_by(year, month) |>
+    summarise(
+      irr_vol_acft = sum(irr_vol_acft, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    arrange(year, month) |> 
+    mutate(location = location) |> 
+    mutate(
+      water_year = if_else(month >= 10, year + 1L, year),
+      date = as.Date(sprintf("%d-%02d-01", year, month))
+    )
+}
+
+```
+
+```{r}
+sprague_irr_monthly <- irrigation_vol_summary(sprague_fields$fields_impacted, "sprague river")
+
+williamson_irr_monthly <- irrigation_vol_summary(williamson_fields$fields_impacted, "williamson river")
+
+wood_irr_monthly <- irrigation_vol_summary(wood_fields$fields_impacted, "wood river")
+
+```
+
+## Create data object
+
+```{r}
+floodplain_acres <- data.frame(location = c("sprague river", "scott river", 
+                                            "williamson river", "wood river"),
+                               inundated_acres = c(sprague_inundation$acres_inundated,
+                                                   scott_inundation$acres_inundated,
+                                                   williamson_inundation$acres_inundated,
+                                                   wood_inundation$acres_inundated),
+                               field_acres = c(sprague_fields$total_field_acres, 
+                                               NA, 
+                                               williamson_fields$total_field_acres, 
+                                               wood_fields$total_field_acres),
+                               n_fields_touched = c(sprague_fields$n_fields_touched, 
+                                                    NA, 
+                                                    williamson_fields$n_fields_touched, 
+                                                    wood_fields$n_fields_touched))
+
+knitr::kable(floodplain_acres)
+
+```
+
+```{r}
+all_irr_summary <- bind_rows(sprague_irr_monthly,
+                             williamson_irr_monthly,
+                             wood_irr_monthly)
+
+knitr::kable(all_irr_summary |> head(20))
+
+```
+
+Save data object
+
+```{r}
+usethis::use_data(floodplain_acres, overwrite = TRUE)
+usethis::use_data(all_irr_summary, overwrite = TRUE)
+```
+
+## Visuals
+
+```{r echo=FALSE}
+river_sf <- rivermile::all_klamath_rivers_line |> filter(river == "Sprague River")
+
+ggplot() +
+  geom_sf(data = river_sf, color = "darkblue", alpha = 0.4) + 
+  geom_sf(data = klamath_irr_vol |> filter(OPENET_ID %in% unique(sprague_fields$fields_impacted$OPENET_ID))) + 
+  geom_sf(data = sprague_inundation$inundation_aggregate,
+          fill = "#2C7FB8", color = NA, alpha = 0.7) +
+  coord_sf(expand = FALSE) +
+  labs(
+    title = "Floodplain Inundation Extent",
+    subtitle = "Sprague River",
+    caption = paste0(
+      "Total inundated area: ",
+      round(sprague_inundation$acres_inundated, 1),
+      " acres"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major = element_line(color = "grey90", size = 0.2),
+    axis.title = element_blank()
+  )
+
+```
+
+```{r echo=FALSE}
+river_sf <- scott_river_sf
+
+ggplot() +
+  geom_sf(data = river_sf, color = "darkblue", alpha = 0.4) + 
+  geom_sf(data = scott_inundation$inundation_aggregate,
+          fill = "#2C7FB8", color = NA, alpha = 0.7) +
+  coord_sf(expand = FALSE) +
+  labs(
+    title = "Floodplain Inundation Extent",
+    subtitle = "Scott River - river miles 21 to 46",
+    caption = paste0(
+      "Total inundated area: ",
+      round(scott_inundation$acres_inundated, 1),
+      " acres"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major = element_line(color = "grey90", size = 0.2),
+    axis.title = element_blank()
+  )
+
+```
+
+```{r echo=FALSE}
+river_sf <- rivermile::all_klamath_rivers_line |> filter(river == "Williamson River")
+
+ggplot() +
+  geom_sf(data = river_sf, color = "darkblue", alpha = 0.4) + 
+  geom_sf(data = klamath_irr_vol |> filter(OPENET_ID %in% unique(williamson_fields$fields_impacted$OPENET_ID))) +
+  geom_sf(data = williamson_inundation$inundation_aggregate,
+          fill = "#2C7FB8", color = NA, alpha = 0.7) +
+  coord_sf(expand = FALSE) +
+  labs(
+    title = "Floodplain Inundation Extent",
+    subtitle = "Williamson River",
+    caption = paste0(
+      "Total inundated area: ",
+      round(williamson_inundation$acres_inundated, 1),
+      " acres"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major = element_line(color = "grey90", size = 0.2),
+    axis.title = element_blank()
+  )
+
+```
+
+```{r echo=FALSE}
+river_sf <- rivermile::all_klamath_rivers_line |> filter(river == "Wood River")
+
+ggplot() +
+  geom_sf(data = river_sf, color = "darkblue", alpha = 0.4) + 
+  geom_sf(data = klamath_irr_vol |> filter(OPENET_ID %in% unique(wood_fields$fields_impacted$OPENET_ID))) +
+  geom_sf(data = wood_inundation$inundation_aggregate,
+          fill = "#2C7FB8", color = NA, alpha = 0.7) +
+  coord_sf(expand = FALSE) +
+  labs(
+    title = "Floodplain Inundation Extent",
+    subtitle = "Wood River",
+    caption = paste0(
+      "Total inundated area: ",
+      round(wood_inundation$acres_inundated, 1),
+      " acres"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major = element_line(color = "grey90", size = 0.2),
+    axis.title = element_blank()
+  )
+
+```
+
+```{r echo=FALSE}
+all_irr_summary |> 
+  group_by(location, water_year) |> 
+  summarise(
+    irr_vol_acft = sum(irr_vol_acft, na.rm = TRUE),
+    .groups = "drop"
+  ) |> 
+  filter(water_year < 2023) |> 
+  ggplot(aes(x = water_year, y = irr_vol_acft, color = location)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c(
+    "sprague river"    = "#1B4079",
+    "williamson river" = "#4D7C8A",
+    "wood river"       = "#7F9C96"
+  )) +
+  labs(
+    x = "Water Year",
+    y = "Total irrigation volume (ac-ft)",
+    title = "Total Irrigation Volume by Water Year",
+    color = "River"
+  ) +
+  theme_minimal(base_size = 12)
+
+ggplot(all_irr_summary,
+       aes(x = month, y = irr_vol_acft, group = water_year)) +
+  geom_line(alpha = 0.4) +
+  scale_x_continuous(breaks = 1:12) +
+  facet_wrap(~location, scales = "free_y") +
+  labs(
+    x = "Month",
+    y = "Irrigation volume (ac-ft)",
+    title = "Monthly Irrigation Volume by Water Year"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+knitr::knit_exit()
+```
+
+## Connect Inundation with Flow
+
+**Sprague Case Study**
+
+There are three flow gages on the mainstem Sprague River at river miles: 5.5, 33, and 72.
+
+```{r}
+sprague_gages <- klamathWaterData::flow_data |> 
+  filter(gage_name %in% c("SPRAGUE RIVER AT CHILOQUIN RIDGE ROAD", "SPRAGUE RIVER AT LONE PINE", "SPRAGUE RIVER AT GODOWA ROAD"))
+
+# sprague_gages |> 
+#   ggplot() + 
+#   geom_line(aes(x = date, y = value)) + 
+#   facet_wrap(~ gage_name) +
+#   theme_minimal()
+
+```
+
+source: <https://waterdata.usgs.gov/monitoring-location/USGS-11501000/#dataTypeId=continuous-00065-0&period=P7D&showFieldMeasurements=true>
+
+-   Sprague River Near Chiloquin, OR - USGS-11501000
+
+-   Altitude of gage: 4202.43 feet
+
+```{r}
+library(dataRetrieval)
+
+site <- "USGS-11501000"
+pcode <- "00065" #stage
+pcode <- "00060" #flow
+
+ts_available <- read_waterdata_ts_meta(monitoring_location_id = site,
+                                  parameter_code = c("00065", "00060"))
+
+test <- readNWISrating(site, type = "base", convertType = TRUE)
+
+
+# sprague_flow <- read_waterdata_daily(monitoring_location_id = site,
+#                                 parameter_code = c("00065", "00060"),
+#                                 statistic_id = c("00003", "00011"),
+#                                 time = c("2024-09-13", "2026-03-02")) 
+#                                 
+# sprague_stage <- read_waterdata_continuous(
+#   monitoring_location_id = "USGS-11501000",
+#   parameter_code = "00065",
+#   time = c("2026-03-12", "2026-03-13")
+# )
+
+sprague_stage <- read_csv("data-raw/continuous_stage.csv") |> 
+  select(monitoring_location_id, parameter_code, date = time, stage_ft = value) |> 
+  mutate(wse_ft = stage_ft + 4202.43,
+         wse_m = wse_ft * 0.3048) 
+sprague_flow <-read_csv("data-raw/continuous_flow.csv") |>
+  select(date = time, discharge_ft_3_s = value) 
+
+sprague_stage_flow <- sprague_stage |> 
+  full_join(sprague_flow) |> 
+  filter(!is.na(discharge_ft_3_s)) 
+
+ggplot() +
+  geom_line(data = sprague_stage_flow, aes(x = date, y = wse_m)) +
+  theme_minimal()
+
+ggplot() +
+  geom_line(data = sprague_stage_flow, aes(x = date, y = discharge_ft_3_s)) +
+  theme_minimal()
+
+```
+
+Summarize WSE and Flow
+
+```{r}
+wse_flow_summary <- sprague_stage_flow |> 
+  group_by(month = lubridate::month(date), year = lubridate::year(date)) |> 
+  summarise(mean_flow_ft_3_s = mean(discharge_ft_3_s, na.rm = T),
+            mean_wse_m = mean(wse_m, na.rm = T))
+
+knitr::kable(wse_flow_summary)
+
+```
+
+### Run dynamic WSE - test case
+
+- with gage at downstream, calculate slope between gage and next location. The river bed should roughly remain aligned with the water surface elevation so we can use the change in elevation to iterately increase the WSE upstream. 
+- multiple gages - linear interpolate between them or just iterate between them
+- 
+
+```{r}
+river_sf <- rivermile::all_klamath_rivers_line |> filter(river == "Sprague River")
+
+sprague_inundation <- inundation_polygon(dem, river_sf, wse = wse_flow_summary[1,]$mean_wse_m, stage_m = 0.6, buffer_m = 1000)
+sprague_inundation$acres_inundated
+
+ggplot() + 
+  geom_sf(data = sprague_inundation$inundation_polygon) + 
+  geom_sf(data = river_sf)
+
+# max
+inundation_polygon(dem, river_sf, wse = max(wse_flow_summary$mean_wse_m), stage_m = 0.6, buffer_m = 1000)$acres_inundated
+# min
+inundation_polygon(dem, river_sf, wse = min(wse_flow_summary$mean_wse_m), stage_m = 0.6, buffer_m = 1000)$acres_inundated
+
+```
+
+## Gage Summary
+
+```{r}
+gages <- klamathWaterData::flow_data |> 
+  filter(gage_name %in% c("SPRAGUE RIVER AT CHILOQUIN RIDGE ROAD", "SPRAGUE RIVER AT LONE PINE", "SPRAGUE RIVER AT GODOWA ROAD"))
+
+gage_ids <- c("USGS-11502500", "USGS-11493500", # williamson
+              "USGS-11504115", # wood
+              "USGS-11501000") # sprague
+
+site <- "USGS-11501000"
+pcode <- "00065" #stage
+pcode <- "00060" #flow
+
+ts_available <- read_waterdata_ts_meta(monitoring_location_id = gage_ids,
+                                  parameter_code = c("00065", "00060"))
+
+leaflet() |> 
+  addTiles() |> 
+  addCircleMarkers(data = ts_available,
+                   popup = ~monitoring_location_id) |> 
+  addPolylines(data = rivermile::all_klamath_rivers_line)
+
+flow <- read_waterdata_daily(monitoring_location_id = gage_ids,
+                                parameter_code = c("00065", "00060"),
+                                statistic_id = c("00003", "00011"),
+                                time = c("2023-03-15", "2026-03-13")) |> 
+  glimpse()
+
+gage_data <- read_waterdata_continuous(
+  monitoring_location_id = gage_ids,
+  parameter_code = c("00065", "00060"),
+  time = c("2026-03-10", "2026-03-13")
+) |> glimpse()
+
+
+```
+
+## GitHub Documents
+
+This is an R Markdown format used for publishing markdown documents to GitHub. When you click the **Knit** button all R code chunks are run and a markdown file (.md) suitable for publishing to GitHub is generated.
+
+## Including Code
+
+You can include R code in the document as follows:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
